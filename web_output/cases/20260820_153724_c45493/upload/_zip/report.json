@@ -1,0 +1,8 @@
+{
+  "volumes_cm3": {
+    "lung_arteries": 1.2,
+    "lung_veins": 1.0,
+    "lung_airways": 1.4,
+    "lung_nodules": 0.3
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "appid": "your-wechat-appid",
+  "secret": "your-wechat-appsecret",
+  "env_version": "release"
+}

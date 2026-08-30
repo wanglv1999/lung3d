@@ -1,0 +1,15 @@
+# 构建上下文排除
+.venv
+venv
+__pycache__
+*.pyc
+web_output
+miniprogram
+deploy
+*.bat
+*.pdb
+.git
+.gitignore
+.idea
+.vscode
+*.log

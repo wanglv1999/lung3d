@@ -1,0 +1,15 @@
+{
+  "pages": [
+    "pages/index/index",
+    "pages/viewer/viewer"
+  ],
+  "window": {
+    "backgroundTextStyle": "light",
+    "navigationBarBackgroundColor": "#161b22",
+    "navigationBarTitleText": "Lung3D",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#0d1117"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}

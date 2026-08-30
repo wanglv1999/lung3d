@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# 密钥：微信小程序 appid / secret（请勿提交真实密钥）
+wx_config.json
+wx_config.local.json
+
+# 运行时缓存
+monai_nodule/.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+Thumbs.db
+.DS_Store

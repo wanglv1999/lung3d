@@ -1,0 +1,25 @@
+<view class="page">
+  <canvas type="webgl" id="webgl" class="canvas"
+          bindtouchstart="touchStart" bindtouchmove="touchMove" bindtouchend="touchEnd"></canvas>
+
+  <view class="loading" wx:if="{{loading}}">模型加载中…</view>
+
+  <view class="panel">
+    <view class="head">
+      <text class="pname">{{name}}</text>
+      <text class="pmeta">{{meta}}</text>
+    </view>
+    <scroll-view scroll-y class="list">
+      <view wx:for="{{structures}}" wx:key="key" class="item" data-key="{{item.key}}" bindtap="onToggle">
+        <view class="swatch" style="background:{{item.color}}"></view>
+        <text class="sname">{{item.name}}</text>
+        <view class="check {{item.checked ? 'on' : ''}}"></view>
+      </view>
+    </scroll-view>
+    <view class="btns">
+      <view class="btn" bindtap="onReset">复位视角</view>
+      <view class="btn" bindtap="onAll">全部显示</view>
+      <view class="btn" bindtap="onNone">全部隐藏</view>
+    </view>
+  </view>
+</view>

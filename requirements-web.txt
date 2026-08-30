@@ -1,0 +1,13 @@
+# Lung3D Web 后端轻量依赖（云托管/无 GPU 服务器用）
+# 说明：本文件仅包含 Web 展示 + 网格生成所需依赖，
+#       不含 torch / TotalSegmentator / MONAI（分割管线不在服务器上跑）。
+# 上传的必须是已分割的 nii.gz 或病例 zip，由本服务直接提取网格。
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+numpy>=1.26
+nibabel>=5.2
+scipy>=1.11
+scikit-image>=0.21
+trimesh>=4.0
+segno>=1.6

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Lung3D 肺部分割三维查看器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h1>Lung3D</h1>
+    <p class="sub">肺部分割三维查看</p>
+
+    <div id="upload-box">
+      <input type="file" id="file-input" multiple accept=".nii,.nii.gz,.zip">
+      <div id="upload-hint">
+        点击选择文件<br>支持：分割 nii.gz / 病例目录 zip / 多文件
+      </div>
+      <div id="progress" hidden>处理中…</div>
+    </div>
+
+    <div id="case-panel" hidden>
+      <div class="case-head">
+        <span id="case-name"></span>
+        <button id="btn-upload-more" title="上传其它病例">＋</button>
+      </div>
+      <div class="case-meta" id="case-meta"></div>
+
+      <div id="struct-list"></div>
+
+      <div class="btn-row">
+        <button id="btn-reset">复位视角</button>
+        <button id="btn-all" >全部显示</button>
+        <button id="btn-none">全部隐藏</button>
+      </div>
+      <button id="btn-wxcode" class="wide">生成微信小程序码（扫码观看）</button>
+      <p class="tips">左键拖动：旋转 ｜ 右键/中键：平移 ｜ 滚轮：缩放<br>触屏：单指旋转 双指缩放/平移</p>
+    </div>
+
+    <div id="error" hidden></div>
+  </div>
+
+  <div id="viewport"></div>
+</div>
+
+<div id="qr-modal">
+  <div class="qr-box">
+    <div class="qr-head">
+      <span>微信扫码观看 3D</span>
+      <button id="qr-close" title="关闭">×</button>
+    </div>
+    <img id="qr-img" alt="二维码">
+    <div id="qr-hint"></div>
+    <div class="qr-foot">
+      <button id="btn-qr-wx">小程序码</button>
+      <button id="btn-qr-url">网页版二维码</button>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/"
+  }
+}
+</script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
