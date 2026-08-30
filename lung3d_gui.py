@@ -13,11 +13,15 @@ Lung3D 分割重建图形界面（PySide6）
   或: python lung3d_gui.py
 """
 import argparse
+import os
 import sys
+import tempfile
+import threading
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QLockFile
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox, QDoubleSpinBox,
@@ -26,17 +30,31 @@ from PySide6.QtWidgets import (
 
 
 class StdoutPipe:
-    """把 print() 输出转发为 Qt 信号。"""
+    """把 print() 输出转发为 Qt 信号。PySide6 中 Signal 需用 .emit() 发送。"""
 
     def __init__(self, emit):
         self._emit = emit
 
     def write(self, s):
         if s:
-            self._emit(s)
+            if callable(self._emit):
+                self._emit(s)
+            else:
+                self._emit.emit(s)
 
     def flush(self):
         pass
+
+    def isatty(self):
+        return False
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    @property
+    def encoding(self):
+        return "utf-8"
 
 
 class ReconstructWorker(QThread):
@@ -60,12 +78,50 @@ class ReconstructWorker(QThread):
         self._stop = True
 
     def run(self):
-        import lung3d_reconstruct as lr
-
         old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = StdoutPipe(self.log)
-        sys.stderr = StdoutPipe(self.log)
+
+        out_root = Path(self._output).resolve()
+        log_path = out_root / "gui_run.log"
         try:
+            out_root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            log_path = Path(os.environ.get("TEMP", ".")) / "lung3d_gui.log"
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+        logf = None
+        try:
+            logf = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            pass
+
+        def emit(s):
+            if threading.current_thread() is threading.main_thread():
+                if logf is not None:
+                    try:
+                        logf.write(s)
+                        logf.flush()
+                    except Exception:
+                        pass
+                return
+            self.log.emit(s)
+            if logf is not None:
+                try:
+                    logf.write(s)
+                    logf.flush()
+                except Exception:
+                    pass
+
+        sys.stdout = StdoutPipe(emit)
+        sys.stderr = StdoutPipe(emit)
+        try:
+            try:
+                import lung3d_reconstruct as lr
+            except Exception as e:
+                raise RuntimeError(f"无法导入分割引擎 lung3d_reconstruct: {e}") from e
+
             args = argparse.Namespace(
                 device=self._device,
                 fast=self._fast,
@@ -74,8 +130,16 @@ class ReconstructWorker(QThread):
                 nodule_model=self._nodule_model,
             )
             root = Path(self._input).resolve()
-            out_root = Path(self._output).resolve()
-            out_root.mkdir(parents=True, exist_ok=True)
+            emit("========== Lung3D 分割重建 ==========\n")
+            emit(f"输入: {root}\n")
+            emit(f"输出: {out_root}\n")
+            emit(f"设备: {self._device}   快速模式: {self._fast}   "
+                 f"结节检测: {'跳过' if self._no_nodules else '开启'}   "
+                 f"分数阈值: {self._nodule_score}\n")
+            emit(f"结节模型: {self._nodule_model}\n")
+            if logf is not None:
+                emit(f"日志文件: {log_path}\n")
+
             if not root.exists():
                 raise RuntimeError(f"输入不存在: {root}")
 
@@ -86,33 +150,40 @@ class ReconstructWorker(QThread):
                 raise RuntimeError("未找到可处理的病例（DICOM目录或NIfTI）。")
 
             total = len(cases)
-            self.log.emit(f"共 {total} 个病例，输出到 {out_root}\n")
+            emit(f"共 {total} 个病例，开始处理…\n")
             ok = failed = 0
             for i, case in enumerate(cases, 1):
                 if self._stop:
-                    self.log.emit("\n[停止] 用户请求停止，已跳过剩余病例。\n")
+                    emit("\n[停止] 用户请求停止，已跳过剩余病例。\n")
                     break
                 case_dir = out_root / f"case_{i:03d}_{case.name}"
                 try:
                     lr.process_case(case, case_dir, args)
                     ok += 1
                 except Exception as e:
-                    self.log.emit(f"!!! 病例 {case} 处理失败: {e}\n{traceback.format_exc()}\n")
+                    emit(f"!!! 病例 {case} 处理失败: {e}\n{traceback.format_exc()}\n")
                     failed += 1
                 self.progress.emit(i, total)
             msg = "全部完成。" if ok else "未完成任何病例。"
+            emit(msg + "\n")
             self.done.emit(ok, failed, msg)
         except Exception:
-            self.log.emit(traceback.format_exc())
-            self.done.emit(0, 1, f"处理失败: {traceback.format_exc().splitlines()[-1]}")
+            tb = traceback.format_exc()
+            emit("处理失败:\n" + tb)
+            self.done.emit(0, 1, "处理失败，详见日志。")
         finally:
             sys.stdout, sys.stderr = old_out, old_err
+            if logf is not None:
+                try:
+                    logf.close()
+                except Exception:
+                    pass
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lung3D 分割重建")
+        self.setWindowTitle("Lung3D 分割重建 v1.1.5")
         self.resize(920, 640)
 
         self.settings = QSettings("Lung3D", "ReconstructGUI")
@@ -271,6 +342,15 @@ class MainWindow(QMainWindow):
 
         self._save_settings()
         self.log_area.clear()
+        self.log_area.append("========== 开始处理 ==========")
+        self.log_area.append(f"输入: {inp}")
+        self.log_area.append(f"输出: {out}")
+        self.log_area.append(f"设备: {self.device_combo.currentText()}   "
+                             f"快速: {'是' if self.fast_cb.isChecked() else '否'}   "
+                             f"结节: {'跳过' if self.no_nodule_cb.isChecked() else '开启'}   "
+                             f"阈值: {self.score_spin.value():.2f}")
+        self.log_area.append(f"模型: {model}")
+        self.log_area.append("")
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_open_out.setEnabled(False)
@@ -285,9 +365,9 @@ class MainWindow(QMainWindow):
             nodule_score=float(self.score_spin.value()),
             nodule_model=model,
         )
-        self.worker.log.connect(self._append_log)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.done.connect(self._on_done)
+        self.worker.log.connect(self._append_log, Qt.QueuedConnection)
+        self.worker.progress.connect(self._on_progress, Qt.QueuedConnection)
+        self.worker.done.connect(self._on_done, Qt.QueuedConnection)
         self.worker.start()
         self.statusBar().showMessage("处理中…")
 
@@ -298,9 +378,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("正在停止（当前病例完成后生效）…")
 
     def _append_log(self, text):
-        self.log_area.moveCursor(self.log_area.textCursor().End)
+        cursor = self.log_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.log_area.setTextCursor(cursor)
         self.log_area.insertPlainText(text)
-        self.log_area.moveCursor(self.log_area.textCursor().End)
+        cursor = self.log_area.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.log_area.setTextCursor(cursor)
 
     def _on_progress(self, done, total):
         self.progress.setRange(0, total)
@@ -332,6 +416,15 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Lung3D 分割重建")
+
+    lock = QLockFile(os.path.join(tempfile.gettempdir(), "lung3d_gui.lock"))
+    if not lock.tryLock(100):
+        QMessageBox.warning(None, "Lung3D 分割重建",
+                            "已有 Lung3D 分割重建 实例在运行。\n\n"
+                            "请先关闭之前的窗口（或检查任务管理器中的 pythonw 进程）再重新打开，"
+                            "避免多个实例同时占用 GPU 导致崩溃。")
+        sys.exit(0)
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

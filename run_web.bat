@@ -1,12 +1,18 @@
 @echo off
-rem Lung3D Web server launcher (ASCII only - do not add Chinese)
-setlocal
-set ROOT=%~dp0
-set PY=%ROOT%.venv\Scripts\python.exe
+rem Lung3D Web server launcher.
+rem Usage: run_web.bat [--host 0.0.0.0] [--port 8000]
+chcp 65001 >nul
+setlocal EnableDelayedExpansion
+
+set "APP=%~dp0lung3d_api.py"
+
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" (where python.exe >nul 2>&1 && set "PY=python.exe")
 
 if not exist "%PY%" (
-    echo [Lung3D] venv not found: %PY%
-    echo Create it first:  .venv\Scripts\python -m venv .venv  or use your installed Python
+    echo [ERROR] No Python interpreter found.
+    echo Create a venv first:  py -3.12 -m venv .venv
+    echo Install deps:         .venv\Scripts\python.exe -m pip install -r requirements-web.txt
     pause
     exit /b 1
 )
@@ -14,7 +20,7 @@ if not exist "%PY%" (
 start "" "http://localhost:8000"
 echo [Lung3D] Web server: http://localhost:8000
 echo [Lung3D] Press Ctrl+C to stop.
-"%PY%" "%ROOT%lung3d_api.py" --host 0.0.0.0 --port 8000 --web "%ROOT%web"
+"%PY%" "%APP%" --host 0.0.0.0 --port 8000 --web "%~dp0web"
 
 echo.
 if errorlevel 1 (

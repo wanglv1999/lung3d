@@ -77,6 +77,8 @@ def find_dicom_cases(root: Path):
 
 
 def dicom_to_nifti(dicom_dir: Path, out_nii: Path, series_uid: str = ""):
+    import shutil
+    import tempfile
     import SimpleITK as sitk
 
     if series_uid:
@@ -94,7 +96,17 @@ def dicom_to_nifti(dicom_dir: Path, out_nii: Path, series_uid: str = ""):
     else:
         # 退化为直接读取目录（部分未标号数据）
         img = sitk.ReadImage(str(dicom_dir))
-    sitk.WriteImage(img, str(out_nii))
+
+    # ITK 的 nifti C 库无法写入含非 ASCII(如中文)字符的路径，
+    # 因此先写到 ASCII 临时目录，再用 Python(Unicode 安全)复制到目标路径。
+    out_nii.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="lung3d_"))
+    tmp_file = tmp_dir / "ct.nii.gz"
+    try:
+        sitk.WriteImage(img, str(tmp_file))
+        shutil.copyfile(tmp_file, out_nii)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return out_nii
 
 
@@ -405,18 +417,32 @@ def export_mesh(mask2d, affine, stl_path, obj_path=None, label_name="", smooth=8
     smoother.Update()
     poly = smoother.GetOutput()
 
-    if stl_path:
-        writer = vtk.vtkSTLWriter()
-        writer.SetFileName(str(stl_path))
-        writer.SetFileTypeToBinary()
-        writer.SetInputData(poly)
-        writer.Write()
+    if stl_path or obj_path:
+        import shutil
+        import tempfile
 
-    if obj_path:
-        ow = vtk.vtkOBJWriter()
-        ow.SetFileName(str(obj_path))
-        ow.SetInputData(poly)
-        ow.Write()
+        # VTK 写文件同样使用 C 库 fopen，无法写含中文等非 ASCII 的路径，
+        # 先写到 ASCII 临时目录再复制到目标。
+        tmp_dir = Path(tempfile.mkdtemp(prefix="lung3d_mesh_"))
+        try:
+            if stl_path:
+                tmp_stl = tmp_dir / "out.stl"
+                writer = vtk.vtkSTLWriter()
+                writer.SetFileName(str(tmp_stl))
+                writer.SetFileTypeToBinary()
+                writer.SetInputData(poly)
+                writer.Write()
+                shutil.copyfile(tmp_stl, stl_path)
+
+            if obj_path:
+                tmp_obj = tmp_dir / "out.obj"
+                ow = vtk.vtkOBJWriter()
+                ow.SetFileName(str(tmp_obj))
+                ow.SetInputData(poly)
+                ow.Write()
+                shutil.copyfile(tmp_obj, obj_path)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
     return True
 
 
