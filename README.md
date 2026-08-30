@@ -18,11 +18,13 @@
 
 ```
 .
-├── lung3d_reconstruct.py     # 软件一：分割重建批处理脚本
+├── lung3d_reconstruct.py     # 软件一：分割重建批处理脚本（核心引擎）
+├── lung3d_gui.py             # 软件一：分割重建图形界面（PySide6，推荐）
 ├── viewer3d.py               # 软件二：桌面 3D 查看器（VTK+PySide6）
 ├── lung3d_api.py             # Web 后端（FastAPI）
 ├── view_scene.py             # 3D Slicer 查看脚本（可选）
-├── run_lung3d.bat            # 一键启动重建
+├── run_lung3d.bat            # 一键启动重建（命令行版）
+├── run_lung3d_gui.bat        # 一键启动重建（图形界面版）
 ├── run_viewer.bat            # 一键启动查看器
 ├── run_web.bat               # 一键启动 Web 后端
 ├── view_in_slicer.bat        # 一键在 3D Slicer 中查看
@@ -65,7 +67,16 @@ PyTorch CUDA 版请按注释单独安装（见 `requirements.txt` 顶部说明�
 
 ### 1. 分割重建（软件一）
 
-支持单个 DICOM 目录、NIfTI 文件，或含多个病例的父目录（自动批量）：
+推荐使用图形界面：
+
+```bat
+run_lung3d_gui.bat
+```
+
+在界面中选择输入路径（DICOM 目录 / NIfTI 文件 / 含多病例的父目录均可）、输出目录，
+设置推理设备、快速模式、结节分数阈值等参数后点击「开始处理」，实时查看日志与进度。
+
+命令行批处理方式同样支持：
 
 ```bat
 run_lung3d.bat --input D:\病例\case01 --output .\output
