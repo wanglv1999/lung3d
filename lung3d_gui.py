@@ -28,6 +28,39 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QFileDialog, QMessageBox, QGroupBox, QFrame,
 )
 
+# ---------------------------------------------------------------------------
+# 部署引导（打包版生效）：若安装目录存在内置权重目录，则使用内置权重与用户级配置；
+# 开发版（无该目录）行为不变，仍使用 ~/.totalsegmentator。
+# ---------------------------------------------------------------------------
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+_BUNDLED_WEIGHTS = os.path.join(INSTALL_DIR, "totalseg_weights")
+if os.path.isdir(_BUNDLED_WEIGHTS):
+    os.environ.setdefault("TOTALSEG_WEIGHTS_PATH", _BUNDLED_WEIGHTS)
+    _ts_home = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                            "Lung3D", "totalseg")
+    os.environ.setdefault("TOTALSEG_HOME_DIR", _ts_home)
+    try:
+        os.makedirs(_ts_home, exist_ok=True)
+        cfg = os.path.join(_ts_home, "config.json")
+        if not os.path.exists(cfg):
+            import json
+            json.dump({
+                "totalseg_id": "totalseg_" + os.urandom(4).hex().upper(),
+                "send_usage_stats": False,
+                "prediction_counter": 0,
+            }, open(cfg, "w", encoding="utf-8"), indent=4)
+    except Exception:
+        pass
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
+
+def _cuda_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
 
 class StdoutPipe:
     """把 print() 输出转发为 Qt 信号。PySide6 中 Signal 需用 .emit() 发送。"""
@@ -183,7 +216,7 @@ class ReconstructWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lung3D 分割重建 v1.1.5")
+        self.setWindowTitle("Lung3D 分割重建 v1.3.0")
         self.resize(920, 640)
 
         self.settings = QSettings("Lung3D", "ReconstructGUI")
@@ -304,8 +337,9 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         self.in_edit.setText(self.settings.value("input", ""))
         self.out_edit.setText(self.settings.value("output", ""))
-        dev = self.settings.value("device", "cuda")
-        self.device_combo.setCurrentText(dev if dev in ("cuda", "cpu") else "cuda")
+        default_dev = "cuda" if _cuda_available() else "cpu"
+        dev = self.settings.value("device", default_dev)
+        self.device_combo.setCurrentText(dev if dev in ("cuda", "cpu") else default_dev)
         self.fast_cb.setChecked(self.settings.value("fast", "false") == "true")
         self.no_nodule_cb.setChecked(self.settings.value("no_nodules", "false") == "true")
         self.score_spin.setValue(float(self.settings.value("nodule_score", 0.3)))
