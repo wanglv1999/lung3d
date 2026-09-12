@@ -52,6 +52,7 @@ if os.path.isdir(_BUNDLED_WEIGHTS):
     except Exception:
         pass
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def _cuda_available():

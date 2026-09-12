@@ -30,7 +30,20 @@ from pathlib import Path
 
 import numpy as np
 
+# 减少 PyTorch CUDA 显存碎片化（需在 torch 初始化 CUDA 前设置）
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 DEVICE_DEFAULT = "cuda"
+
+
+def free_gpu_memory():
+    """强制释放 Python/GC 可回收对象并归还 PyTorch 显存缓存，供下一步骤使用。"""
+    import gc
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -483,29 +496,45 @@ def process_case(case_input: Path, case_dir: Path, args):
     log.append(f"  TotalSegmentator lung_vessels 完成 ({ts_elapsed:.1f}s)")
     log.append("    输出结构: " + ", ".join(masks.keys()))
 
+    # 释放 TotalSegmentator 占用的显存，避免下一步 MONAI 检测显存不足
+    free_gpu_memory()
+
     # 3. 肺结节检测
     nodule_mask = None
     nodule_report = []
     if not args.no_nodules:
-        try:
-            detector = NoduleDetector(args.nodule_model, device=args.device, score_thresh=args.nodule_score)
-            t0 = time.time()
-            boxes, scores, _ = detector.predict(nii_path)
-            log.append(f"  MONAI 肺结节检测完成 ({time.time()-t0:.1f}s)，检出 {len(boxes)} 个")
-            nifti = nib.load(str(nii_path))
-            if len(boxes):
-                nodule_mask = box_to_voxel_mask(boxes, nifti, nifti.shape)
-            for i, (b, s) in enumerate(zip(boxes, scores)):
-                nodule_report.append(
-                    {
-                        "index": i + 1,
-                        "center_mm_ras": [round(float(x), 2) for x in b[:3]],
-                        "size_mm": [round(float(x), 2) for x in b[3:]],
-                        "score": round(float(s), 4),
-                    }
-                )
-        except Exception as e:
-            log.append(f"  !!! 结节检测失败: {e}")
+        devices = [args.device]
+        if args.device == "cuda":
+            devices.append("cpu")  # GPU 显存不足时降级到 CPU
+        for dev in devices:
+            try:
+                detector = NoduleDetector(args.nodule_model, device=dev, score_thresh=args.nodule_score)
+                t0 = time.time()
+                boxes, scores, _ = detector.predict(nii_path)
+                log.append(f"  MONAI 肺结节检测完成 ({time.time()-t0:.1f}s)，检出 {len(boxes)} 个"
+                           + ("" if dev == args.device else f"，(设备: {dev})"))
+                nifti = nib.load(str(nii_path))
+                if len(boxes):
+                    nodule_mask = box_to_voxel_mask(boxes, nifti, nifti.shape)
+                for i, (b, s) in enumerate(zip(boxes, scores)):
+                    nodule_report.append(
+                        {
+                            "index": i + 1,
+                            "center_mm_ras": [round(float(x), 2) for x in b[:3]],
+                            "size_mm": [round(float(x), 2) for x in b[3:]],
+                            "score": round(float(s), 4),
+                        }
+                    )
+                break
+            except Exception as e:
+                msg = str(e)
+                if dev == args.device and args.device == "cuda" and "out of memory" in msg.lower():
+                    log.append(f"  !!! GPU 显存不足: {msg}\n      自动改用 CPU 重试（较慢）…")
+                    free_gpu_memory()
+                    continue
+                log.append(f"  !!! 结节检测失败: {e}")
+                break
+        free_gpu_memory()
 
     # 4. 合并标签体数据
     nifti = nib.load(str(nii_path))
