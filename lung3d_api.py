@@ -29,10 +29,12 @@ Lung3D Web 后端服务（FastAPI）
 """
 import argparse
 import base64
+import gc
 import io
 import json
 import os
 import shutil
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -42,12 +44,17 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "web_output" / "cases"
+
+# 并发处理上限：同时只处理 MAX_CONCURRENT_PROCESSING 个病例，
+# 其余排队等待，避免多任务同时占用内存导致容器 OOM。
+MAX_CONCURRENT_PROCESSING = max(1, int(os.environ.get("MAX_CONCURRENT_PROCESSING", "1")))
+_PROCESS_SEM = threading.BoundedSemaphore(MAX_CONCURRENT_PROCESSING)
 
 STRUCTURES = [
     dict(key="lung_arteries", name="肺动脉", color=[1.00, 0.20, 0.20]),
@@ -91,17 +98,25 @@ def downsample_binary(mask, factor):
     if factor <= 1 or mask.ndim != 3:
         return mask
     from scipy import ndimage
-    return (ndimage.zoom(mask.astype(np.float32), 1.0 / factor, order=1) > 0.5)
+    return (ndimage.zoom(mask.astype(np.uint8), 1.0 / factor, order=0) > 0.5)
 
 
-def mask_to_trimesh(mask, affine, ds_factor=2, smooth=5):
-    """二值掩膜 -> trimesh（RAS 世界坐标，与桌面查看器一致）。"""
+def mask_to_trimesh(mask, affine, ds_factor=2, smooth=15, prune_mm=0.0):
+    """二值掩膜 -> trimesh（RAS 世界坐标，与桌面查看器一致）。
+    prune_mm: >0 时按管径阈值剪除细血管（在降采样后计算，避免内存爆槓）。"""
     import skimage.measure
     import trimesh
 
     arr = downsample_binary((mask > 0), ds_factor) if ds_factor > 1 else (mask > 0)
     if arr.sum() == 0:
         return None
+    if prune_mm > 0:
+        from scipy import ndimage
+        spacing_ds = np.linalg.norm(affine[:3, :3], axis=0) * ds_factor
+        d = ndimage.distance_transform_edt(arr, sampling=spacing_ds)
+        arr = (d >= prune_mm)
+        if arr.sum() == 0:
+            return None
     verts, faces, _, _ = skimage.measure.marching_cubes(arr, level=0.5)
     spacing, origin, R = np_affine_parts(affine)
     world = verts @ (R @ np.diag(spacing * ds_factor)).T + origin
@@ -117,7 +132,7 @@ def mask_to_trimesh(mask, affine, ds_factor=2, smooth=5):
         pass
     if smooth > 0 and len(mesh.faces) > 4:
         try:
-            trimesh.smoothing.filter_laplacian(mesh, iterations=smooth, lamb=0.5)
+            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=0.5, iterations=smooth)
         except Exception:
             pass
     try:
@@ -125,6 +140,17 @@ def mask_to_trimesh(mask, affine, ds_factor=2, smooth=5):
     except Exception:
         pass
     return mesh
+
+
+def prune_thin_vessels(mask, affine, prune_mm=1.5, ds_factor=1):
+    """按管径阈值剪除远端细血管：移除到边缘距离 < prune_mm(mm) 的体素，保留主干。
+    ds_factor: 堵膜已降采样的倍数（用于校准 sampling）。"""
+    if prune_mm <= 0:
+        return mask
+    from scipy import ndimage
+    spacing = np.linalg.norm(affine[:3, :3], axis=0) * ds_factor
+    d = ndimage.distance_transform_edt((mask > 0), sampling=spacing)
+    return (d >= prune_mm)
 
 
 def ct_surface_trimesh(ct_data, affine, ds_factor=4, threshold=-400.0):
@@ -280,6 +306,19 @@ def build_case(case_dir, masks, ct_data, ct_affine, report):
     affine = None
     structures = []
     palette_iter = iter(PALETTE)
+    try:
+        distal_prune_mm = float(os.environ.get("DISTAL_PRUNE_MM", "0.75"))
+    except Exception:
+        distal_prune_mm = 0.75
+    # 网格降采样系数：数值越大内存/耗时越低（质量略降），容器内存紧张时调大
+    try:
+        ds_env = max(1, int(os.environ.get("MESH_DS_FACTOR", "2")))
+    except Exception:
+        ds_env = 2
+    try:
+        ds_wall = max(1, int(os.environ.get("WALL_DS_FACTOR", str(ds_env))))
+    except Exception:
+        ds_wall = ds_env
     for key, (m, a) in masks.items():
         if not m.any():
             continue
@@ -288,7 +327,11 @@ def build_case(case_dir, masks, ct_data, ct_affine, report):
         st = next((s for s in STRUCTURES if s["key"] == key), None)
         name = st["name"] if st else key
         color = st["color"] if st else next(palette_iter)
-        mesh = mask_to_trimesh(m, a)
+        if key == "lung_airways_wall":
+            mesh = mask_to_trimesh(m, a, ds_factor=ds_wall, smooth=0)
+        else:
+            prune_mm = distal_prune_mm if key in ("lung_arteries", "lung_veins") else 0.0
+            mesh = mask_to_trimesh(m, a, ds_factor=ds_env, prune_mm=prune_mm)
         if mesh is None:
             continue
         fname = f"{key}.glb"
@@ -302,6 +345,7 @@ def build_case(case_dir, masks, ct_data, ct_affine, report):
             "volume_cm3": round(float(m.sum() * vox), 3),
             "voxels": int(m.sum()),
         })
+        gc.collect()
 
     case_info = {
         "case_id": case_dir.name,
@@ -330,8 +374,59 @@ def build_case(case_dir, masks, ct_data, ct_affine, report):
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
+def _process_upload_worker(case_dir, case_name):
+    """后台异步处理上传的病例（受并发信号量限制，避免同时占用内存）。"""
+    with _PROCESS_SEM:
+        try:
+            tmp = case_dir / "upload"
+            masks, ct_data, ct_affine, report = {}, None, None, {}
+            for p in sorted(tmp.iterdir()):
+                fname = p.name
+                if fname.lower().endswith(".zip"):
+                    with zipfile.ZipFile(p) as z:
+                        z.extractall(tmp / "_zip")
+                    masks, ct_data, ct_affine, report = extract_from_case_dir(tmp / "_zip")
+                    break
+                elif fname.lower().endswith((".nii", ".nii.gz")):
+                    img = load_nifti(p)
+                    if nifti_is_segmentation(img):
+                        res = masks_from_nifti(p, fname)
+                        if res:
+                            masks.update(res)
+                    else:
+                        ct_data, ct_affine = load_ct(p)
+            if not masks and ct_data is None:
+                files_info = []
+                for p in sorted(tmp.iterdir()):
+                    try:
+                        files_info.append("%s (%d bytes)" % (p.name, p.stat().st_size))
+                    except Exception:
+                        files_info.append(p.name)
+                (case_dir / "error.txt").write_text(
+                    "无法识别文件：需要分割 nii.gz、多标签 nii.gz 或病例目录 zip。收到: " + "; ".join(files_info),
+                    encoding="utf-8")
+                return
+            case_info = build_case(case_dir, masks, ct_data, ct_affine, report)
+            if not case_info["structures"] and case_info["ct_mesh"] is None:
+                (case_dir / "error.txt").write_text("未提取到任何结构网格", encoding="utf-8")
+                return
+            if case_name and case_name.strip():
+                case_info["name"] = case_name.strip()
+                (case_dir / "report.json").write_text(
+                    json.dumps(case_info, ensure_ascii=False, indent=2), encoding="utf-8")
+            print("case processed:", case_dir.name)
+        except Exception as e:
+            try:
+                (case_dir / "error.txt").write_text("处理失败: %s" % e, encoding="utf-8")
+            except Exception:
+                pass
+            print("case processing error:", case_dir.name, e)
+        finally:
+            gc.collect()
+
+
 @app.post("/api/process")
-async def process_files(files: list[UploadFile] = File(...)):
+async def process_files(files: list[UploadFile] = File(...), name: str = Form(None), filename: str = Form(None)):
     if not files:
         return JSONResponse({"error": "未上传文件"}, status_code=400)
 
@@ -341,46 +436,63 @@ async def process_files(files: list[UploadFile] = File(...)):
     tmp = case_dir / "upload"
     tmp.mkdir(exist_ok=True)
 
-    masks, ct_data, ct_affine, report = {}, None, None, {}
-
+    use_filename = (filename or "").strip()
     for uf in files:
-        name = Path(uf.filename or "file").name
-        save_path = tmp / name
+        fname = (use_filename or Path(uf.filename or "file").name)
+        use_filename = ""
+        fname = Path(fname).name
+        save_path = tmp / fname
+        # 异步分块读入，避免大文件同步读阻塞事件循环
+        size = 0
         with save_path.open("wb") as f:
-            shutil.copyfileobj(uf.file, f)
+            while True:
+                chunk = await uf.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                size += len(chunk)
+        if size == 0:
+            try:
+                save_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-        if name.lower().endswith(".zip"):
-            with zipfile.ZipFile(save_path) as z:
-                z.extractall(tmp / "_zip")
-            masks, ct_data, ct_affine, report = extract_from_case_dir(tmp / "_zip")
-            break
-        elif name.lower().endswith((".nii", ".nii.gz")):
-            img = load_nifti(save_path)
-            if nifti_is_segmentation(img):
-                res = masks_from_nifti(save_path, name)
-                if res:
-                    masks.update(res)
-            else:
-                ct_data, ct_affine = load_ct(save_path)
-
-    if not masks and ct_data is None:
-        shutil.rmtree(case_dir, ignore_errors=True)
-        return JSONResponse({"error": "无法识别文件：需要分割 nii.gz、多标签 nii.gz 或病例目录 zip"}, status_code=400)
-
-    case_info = build_case(case_dir, masks, ct_data, ct_affine, report)
-    if not case_info["structures"] and case_info["ct_mesh"] is None:
-        shutil.rmtree(case_dir, ignore_errors=True)
-        return JSONResponse({"error": "未提取到任何结构网格"}, status_code=400)
-
-    return case_info
+    threading.Thread(target=_process_upload_worker, args=(case_dir, name), daemon=True).start()
+    return {"status": "processing", "case_id": case_id}
 
 
 @app.get("/api/case/{case_id}")
 def get_case(case_id: str):
+    d = OUTPUT_DIR / case_id
+    rp = d / "report.json"
+    if not rp.exists():
+        ep = d / "error.txt"
+        if ep.exists():
+            return JSONResponse({"error": ep.read_text(encoding="utf-8")}, status_code=400)
+        return JSONResponse({"error": "病例不存在或处理中"}, status_code=404)
+    return json.loads(rp.read_text(encoding="utf-8"))
+
+@app.delete("/api/case/{case_id}")
+def delete_case(case_id: str):
+    d = OUTPUT_DIR / case_id
+    rp = d / "report.json"
+    if not rp.exists():
+        return JSONResponse({"error": "病例不存在"}, status_code=404)
+    shutil.rmtree(d, ignore_errors=True)
+    return {"ok": True, "case_id": case_id}
+
+@app.post("/api/case/{case_id}/rename")
+def rename_case(case_id: str, payload: dict):
     rp = OUTPUT_DIR / case_id / "report.json"
     if not rp.exists():
         return JSONResponse({"error": "病例不存在"}, status_code=404)
-    return json.loads(rp.read_text(encoding="utf-8"))
+    new_name = (payload.get("name") or "").strip()
+    if not new_name:
+        return JSONResponse({"error": "名称不能为空"}, status_code=400)
+    info = json.loads(rp.read_text(encoding="utf-8"))
+    info["name"] = new_name
+    rp.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "case_id": case_id, "name": new_name}
 
 
 @app.get("/api/mesh/{case_id}/{name}")
@@ -507,6 +619,46 @@ def qrcode(case: str, base: str = ""):
     buf = io.BytesIO()
     qr.save(buf, kind="png", scale=8, border=2)
     return Response(content=buf.getvalue(), media_type="image/png")
+
+def cleanup_old_cases(days=7):
+    """删除超过 days 天未更新的病例（存储自动清理）。"""
+    cutoff = time.time() - days * 86400
+    if not OUTPUT_DIR.is_dir():
+        return 0
+    removed = 0
+    for d in OUTPUT_DIR.iterdir():
+        try:
+            rp = d / "report.json"
+            mtime = rp.stat().st_mtime if rp.exists() else d.stat().st_mtime
+            if mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+                print("auto-deleted expired case:", d.name)
+        except Exception:
+            continue
+    return removed
+
+
+def _cleanup_loop(interval_hours=6, days=None):
+    if days is None:
+        try:
+            days = int(os.environ.get("CASE_EXPIRE_DAYS", "7"))
+        except Exception:
+            days = 7
+    while True:
+        try:
+            cleanup_old_cases(days)
+        except Exception:
+            pass
+        time.sleep(interval_hours * 3600)
+
+
+@app.on_event("startup")
+def _start_auto_cleanup():
+    t = threading.Thread(target=_cleanup_loop, args=(6,), kwargs={"days": None}, daemon=True)
+    t.start()
+    print("[Lung3D] auto cleanup started: delete cases older than CASE_EXPIRE_DAYS(default 7d) every 6h")
+
 
 
 def main():
