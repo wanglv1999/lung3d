@@ -83,15 +83,15 @@ Page({
   },
 
   init3d(canvas) {
-    const sys = wx.getSystemInfoSync()
-    canvas.width = sys.windowWidth * sys.pixelRatio
-    canvas.height = sys.windowHeight * sys.pixelRatio
+    const win = wx.getWindowInfo()
+    const dpr = Math.min(win.pixelRatio || 2, 2)
+    canvas.width = Math.min(win.windowWidth, 16384)
+    canvas.height = Math.min(win.windowHeight, 16384)
     this.canvas = canvas
 
     const THREE = createScopedThreejs(canvas)
     this.THREE = THREE
     registerGLTFLoader(THREE)
-    const { OrbitControls } = registerOrbit(THREE)
 
     const camera = new THREE.PerspectiveCamera(45, canvas.width / canvas.height, 0.1, 100000)
     camera.position.set(120, 120, 180)
@@ -104,24 +104,26 @@ Page({
     scene.add(dir)
 
     const renderer = new THREE.WebGLRenderer({ antialias: true })
-    renderer.setPixelRatio(sys.pixelRatio)
+    renderer.setPixelRatio(dpr)
     renderer.setSize(canvas.width, canvas.height)
-
-    const controls = new OrbitControls(camera, renderer.domElement)
-    controls.enableDamping = true
-    controls.dampingFactor = 0.08
 
     this.renderer = renderer
     this.scene = scene
     this.camera = camera
-    this.controls = controls
+    this.camTarget = new THREE.Vector3(0, 0, 0)
     this.meshes = {}
+    const pivot = new THREE.Group()
+    scene.add(pivot)
+    this.pivot = pivot
+    const modelGroup = new THREE.Group()
+    pivot.add(modelGroup)
+    this.modelGroup = modelGroup
 
     this.loadAll()
 
     const animate = () => {
       canvas.requestAnimationFrame(animate)
-      controls.update()
+      camera.lookAt(this.camTarget)
       renderer.render(scene, camera)
     }
     animate()
@@ -139,73 +141,88 @@ Page({
       }
     }
 
-    if (this.info.ct_mesh) {
+    const addMesh = (url, color, opacity, depthWrite, key) => {
       pending++
-      loader.load(BASE + this.info.ct_mesh, (gltf) => {
-        const g = gltf.scene
-        g.traverse((o) => {
-          if (o.isMesh) {
-            o.material = new THREE.MeshStandardMaterial({
-              color: 0x8892a0,
-              transparent: true,
-              opacity: 0.15,
-              side: THREE.DoubleSide,
-              depthWrite: false,
-            })
+      wx.downloadFile({
+        url: BASE + url,
+        success: (res) => {
+          if (res.statusCode !== 200) {
+            console.error('download fail', url, res.statusCode)
+            done()
+            return
           }
-        })
-        this.scene.add(g)
-        this.ctGroup = g
-        done()
-      }, undefined, () => done())
+          wx.getFileSystemManager().readFile({
+            filePath: res.tempFilePath,
+            success: (r) => {
+              loader.parse(r.data, '', (gltf) => {
+                const g = gltf.scene
+                g.traverse((o) => {
+                  if (o.isMesh) {
+                    o.material = new THREE.MeshStandardMaterial({
+                      color: color,
+                      roughness: 0.5,
+                      metalness: 0.05,
+                      transparent: true,
+                      opacity: opacity,
+                      side: THREE.DoubleSide,
+                      depthWrite: depthWrite,
+                    })
+                  }
+                })
+                this.modelGroup.add(g)
+                if (key === '__ct__') this.ctGroup = g
+                else this.meshes[key] = g
+                done()
+              }, (e) => {
+                console.error('parse fail', url, e)
+                done()
+              })
+            },
+            fail: (e) => { console.error('readFile fail', url, e); done() },
+          })
+        },
+        fail: (e) => { console.error('downloadFile fail', url, e); done() },
+      })
     }
 
+    if (this.info.ct_mesh) {
+      addMesh(this.info.ct_mesh, 0x8892a0, 0.15, false, '__ct__')
+    }
     for (const st of this.info.structures) {
-      pending++
       const color = new THREE.Color(st.color[0], st.color[1], st.color[2])
-      loader.load(BASE + st.mesh, (gltf) => {
-        const g = gltf.scene
-        g.traverse((o) => {
-          if (o.isMesh) {
-            o.material = new THREE.MeshStandardMaterial({
-              color: color,
-              roughness: 0.5,
-              metalness: 0.05,
-              transparent: true,
-              opacity: 0.92,
-              side: THREE.DoubleSide,
-            })
-          }
-        })
-        this.scene.add(g)
-        this.meshes[st.key] = g
-        done()
-      }, undefined, () => done())
+      addMesh(st.mesh, color, 0.92, true, st.key)
     }
   },
-
   fitCamera() {
     const THREE = this.THREE
+    const savedPos = this.modelGroup.position.clone()
+    const savedQ = this.pivot.quaternion.clone()
+    this.modelGroup.position.set(0, 0, 0)
+    this.pivot.quaternion.set(0, 0, 0, 1)
+    this.pivot.updateMatrixWorld(true)
     const box = new THREE.Box3()
-    this.scene.traverse((o) => {
+    this.modelGroup.traverse((o) => {
       if (o.isMesh && o.visible) {
         const b = new THREE.Box3().setFromObject(o)
         if (!b.isEmpty()) box.union(b)
       }
     })
+    this.modelGroup.position.copy(savedPos)
+    this.pivot.quaternion.copy(savedQ)
     if (box.isEmpty()) return
     const size = new THREE.Vector3()
     box.getSize(size)
     const center = new THREE.Vector3()
     box.getCenter(center)
+    this.modelGroup.position.set(-center.x, -center.y, -center.z)
+    this.camTarget.set(0, 0, 0)
     const maxDim = Math.max(size.x, size.y, size.z) || 1
     const dist = maxDim * 1.9
-    this.camera.position.set(center.x + dist * 0.7, center.y + dist * 0.6, center.z + dist)
+    this.camera.position.set(dist * 0.7, dist * 0.6, dist)
     this.camera.near = Math.max(0.1, maxDim / 10000)
     this.camera.far = maxDim * 50
     this.camera.updateProjectionMatrix()
-    this.controls.target.copy(center)
-    this.controls.update()
+    this.camera.lookAt(this.camTarget)
   },
 
   setVisible(key, visible) {
@@ -241,13 +258,70 @@ Page({
     for (const s of structures) this.setVisible(s.key, false)
   },
 
+  goBack() {
+    const pages = getCurrentPages()
+    if (pages.length > 1) {
+      wx.navigateBack()
+    } else {
+      wx.reLaunch({ url: '/pages/index/index' })
+    }
+  },
+
   touchStart(e) {
-    this.canvas.dispatchTouchEvent({ ...e, type: 'touchstart' })
+    const ts = e.touches || []
+    this._touch = { x1: ts[0] && ts[0].pageX, y1: ts[0] && ts[0].pageY, dist: 0 }
+    if (ts.length >= 2) {
+      this._touch.x2 = ts[1].pageX
+      this._touch.y2 = ts[1].pageY
+      this._touch.dist = Math.hypot(ts[0].pageX - ts[1].pageX, ts[0].pageY - ts[1].pageY)
+    }
   },
   touchMove(e) {
-    this.canvas.dispatchTouchEvent({ ...e, type: 'touchmove' })
+    const ts = e.touches || []
+    const t = this._touch
+    if (!t || ts.length === 0) return
+    if (ts.length >= 2) {
+      const x2 = ts[1].pageX
+      const y2 = ts[1].pageY
+      const d = Math.hypot(ts[0].pageX - x2, ts[0].pageY - y2)
+      if (t.dist > 0) this.zoom(t.dist / Math.max(d, 1))
+      const dx = ((ts[0].pageX - t.x1) + (x2 - t.x2)) / 2
+      const dy = ((ts[0].pageY - t.y1) + (y2 - t.y2)) / 2
+      this.pan(dx, dy)
+      t.x1 = ts[0].pageX; t.y1 = ts[0].pageY; t.x2 = x2; t.y2 = y2; t.dist = d
+    } else {
+      const dx = ts[0].pageX - t.x1
+      const dy = ts[0].pageY - t.y1
+      this.orbit(dx, dy)
+      t.x1 = ts[0].pageX; t.y1 = ts[0].pageY
+    }
   },
   touchEnd(e) {
-    this.canvas.dispatchTouchEvent({ ...e, type: 'touchend' })
+    this._touch = null
+  },
+
+  orbit(dx, dy) {
+    const THREE = this.THREE
+    const SPEED = 0.005
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0)
+    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1)
+    const q = new THREE.Quaternion().setFromAxisAngle(up, dx * SPEED)
+    q.multiply(new THREE.Quaternion().setFromAxisAngle(right, dy * SPEED))
+    this.pivot.quaternion.premultiply(q)
+  },
+  zoom(scale) {
+    const THREE = this.THREE
+    const dir = new THREE.Vector3().subVectors(this.camTarget, this.camera.position).normalize()
+    const dist = Math.max(this.camera.position.distanceTo(this.camTarget) * scale, 1)
+    this.camera.position.copy(this.camTarget).addScaledVector(dir, -dist)
+    this.camera.lookAt(this.camTarget)
+  },
+  pan(dx, dy) {
+    const THREE = this.THREE
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0).multiplyScalar(-dx * 0.5)
+    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1).multiplyScalar(dy * 0.5)
+    const delta = right.add(up)
+    this.camTarget.add(delta)
+    this.camera.position.add(delta)
   },
 })

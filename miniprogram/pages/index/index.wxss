@@ -60,12 +60,25 @@
 .section-title { font-size: 30rpx; font-weight: 600; margin-bottom: 20rpx; }
 .empty { color: #8b949e; font-size: 26rpx; }
 .case {
+  display: flex;
+  align-items: center;
   background: #161b22;
   border: 2rpx solid #30363d;
   border-radius: 12rpx;
   padding: 24rpx;
   margin-bottom: 16rpx;
 }
+.case-body { flex: 1; }
 .case-name { font-size: 30rpx; }
 .case-meta { font-size: 24rpx; color: #8b949e; margin-top: 8rpx; }
+.case-del {
+  margin-left: 20rpx;
+  padding: 10rpx 22rpx;
+  background: #3d1d1d;
+  color: #f85149;
+  border-radius: 8rpx;
+  font-size: 24rpx;
+  flex: none;
+}
 .foot { margin-top: 48rpx; text-align: center; font-size: 24rpx; color: #8b949e; }
+.beian { margin-top: 14rpx; font-size: 22rpx; color: #6e7681; }

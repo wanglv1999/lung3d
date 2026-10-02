@@ -1,14 +1,23 @@
-const { BASE } = require('../../config')
+const { BASE, ICP_BEIAN } = require('../../config')
 
 Page({
   data: {
     loading: false,
     error: '',
     cases: [],
+    icpBeian: ICP_BEIAN,
   },
 
   onShow() {
     this.loadCases()
+  },
+
+  copyBeian() {
+    if (!this.data.icpBeian) return
+    wx.setClipboardData({
+      data: this.data.icpBeian,
+      success: () => wx.showToast({ title: '备案号已复制', icon: 'none' }),
+    })
   },
 
   loadCases() {

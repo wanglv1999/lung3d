@@ -18,11 +18,18 @@
   <view class="section">
     <view class="section-title">最近病例</view>
     <view wx:if="{{cases.length === 0}}" class="empty">暂无病例</view>
-    <view wx:for="{{cases}}" wx:key="id" class="case" data-id="{{item.id}}" bindtap="openCase">
-      <view class="case-name">{{item.name}}</view>
-      <view class="case-meta">{{item.n}} 个结构 · {{item.created}}</view>
+    <view wx:for="{{cases}}" wx:key="id" class="case">
+      <view class="case-body" data-id="{{item.id}}" bindtap="openCase">
+        <view class="case-name">{{item.name}}</view>
+        <view class="case-meta">{{item.n}} 个结构 · {{item.created}}</view>
+      </view>
+      <view class="case-del" data-id="{{item.id}}" catchtap="renameCase">重命名</view>
+      <view class="case-del" data-id="{{item.id}}" catchtap="deleteCase">删除</view>
     </view>
   </view>
 
-  <view class="foot">文件在服务器端生成 3D 网格后返回手机显示</view>
+  <view class="foot">
+    <view>文件在服务器端生成 3D 网格后返回手机显示</view>
+    <view class="beian" wx:if="{{icpBeian}}" bindtap="copyBeian">{{icpBeian}}</view>
+  </view>
 </view>
