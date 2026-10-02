@@ -26,8 +26,8 @@ Page({
     options = options || {}
     const cid = resolveCaseId(options)
     if (cid) {
-      // 扫码直达：按 scene 中的 case_id 从服务器拉取病例
-      wx.showLoading({ title: '加载病例…', mask: true })
+      // 扫码直达：按 scene 中的 case_id 从服务器拉取数据
+      wx.showLoading({ title: '加载数据…', mask: true })
       wx.request({
         url: BASE + '/api/case/' + cid,
         success: (res) => {
@@ -36,7 +36,7 @@ Page({
             wx.setStorageSync('caseInfo', res.data)
             this.start()
           } else {
-            wx.showToast({ title: '病例不存在或网络错误', icon: 'none' })
+            wx.showToast({ title: '数据不存在或网络错误', icon: 'none' })
             setTimeout(() => wx.navigateBack(), 1200)
           }
         },
@@ -54,7 +54,7 @@ Page({
   start() {
     this.info = wx.getStorageSync('caseInfo') || null
     if (!this.info || !this.info.structures) {
-      wx.showToast({ title: '没有病例数据', icon: 'none' })
+      wx.showToast({ title: '没有数据', icon: 'none' })
       wx.navigateBack()
       return
     }

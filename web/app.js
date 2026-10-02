@@ -349,7 +349,7 @@ async function showQr(url) {
 }
 
 $('btn-wxcode').addEventListener('click', () => {
-  if (!currentCaseId) { showError('请先上传或打开一个病例'); return; }
+  if (!currentCaseId) { showError('请先上传或打开数据'); return; }
   showQr(apiBase + '/api/wxacode?case=' + encodeURIComponent(currentCaseId));
 });
 $('btn-qr-wx').addEventListener('click', () => {
@@ -382,6 +382,6 @@ resize();
 if (CASE_ID) {
   fetch(apiBase + '/api/case/' + encodeURIComponent(CASE_ID))
     .then(r => r.json())
-    .then(info => { if (info && info.structures) renderCase(info); else showError('未找到该病例'); })
-    .catch(() => showError('加载病例失败'));
+    .then(info => { if (info && info.structures) renderCase(info); else showError('未找到该数据'); })
+    .catch(() => showError('加载数据失败'));
 }

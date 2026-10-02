@@ -55,8 +55,8 @@ Page({
 
   upload(f) {
     wx.showModal({
-      title: '病例名称',
-      content: '给该病例起个名字（可选）：',
+      title: '数据名称',
+      content: '给该数据起个名字（可选）：',
       editable: true,
       placeholderText: '如：张三 2026-09-01',
       success: (res) => {
@@ -147,7 +147,7 @@ Page({
     wx.showModal({
       title: '重命名',
       editable: true,
-      placeholderText: '输入新的病例名称',
+      placeholderText: '输入新的数据名称',
       success: (res) => {
         if (res.confirm && res.content && res.content.trim()) {
           wx.request({
@@ -173,8 +173,8 @@ Page({
   deleteCase(e) {
     const id = e.currentTarget.dataset.id
     wx.showModal({
-      title: '删除病例',
-      content: '确定删除该病例？删除后不可恢复。',
+      title: '删除数据',
+      content: '确定删除该数据？删除后不可恢复。',
       success: (res) => {
         if (res.confirm) {
           wx.request({

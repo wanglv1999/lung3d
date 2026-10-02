@@ -403,7 +403,7 @@ def _process_upload_worker(case_dir, case_name):
                     except Exception:
                         files_info.append(p.name)
                 (case_dir / "error.txt").write_text(
-                    "无法识别文件：需要分割 nii.gz、多标签 nii.gz 或病例目录 zip。收到: " + "; ".join(files_info),
+                    "无法识别文件：需要分割 nii.gz、多标签 nii.gz 或数据目录 zip。收到: " + "; ".join(files_info),
                     encoding="utf-8")
                 return
             case_info = build_case(case_dir, masks, ct_data, ct_affine, report)
@@ -469,7 +469,7 @@ def get_case(case_id: str):
         ep = d / "error.txt"
         if ep.exists():
             return JSONResponse({"error": ep.read_text(encoding="utf-8")}, status_code=400)
-        return JSONResponse({"error": "病例不存在或处理中"}, status_code=404)
+        return JSONResponse({"error": "数据不存在或处理中"}, status_code=404)
     return json.loads(rp.read_text(encoding="utf-8"))
 
 @app.delete("/api/case/{case_id}")
@@ -477,7 +477,7 @@ def delete_case(case_id: str):
     d = OUTPUT_DIR / case_id
     rp = d / "report.json"
     if not rp.exists():
-        return JSONResponse({"error": "病例不存在"}, status_code=404)
+        return JSONResponse({"error": "数据不存在"}, status_code=404)
     shutil.rmtree(d, ignore_errors=True)
     return {"ok": True, "case_id": case_id}
 
@@ -485,7 +485,7 @@ def delete_case(case_id: str):
 def rename_case(case_id: str, payload: dict):
     rp = OUTPUT_DIR / case_id / "report.json"
     if not rp.exists():
-        return JSONResponse({"error": "病例不存在"}, status_code=404)
+        return JSONResponse({"error": "数据不存在"}, status_code=404)
     new_name = (payload.get("name") or "").strip()
     if not new_name:
         return JSONResponse({"error": "名称不能为空"}, status_code=400)
@@ -571,7 +571,7 @@ def _case_exists(case_id):
 def wxacode(case: str, env: str = None, env_version: str = None):
     """生成打开该病例 3D 页的微信小程序码(PNG)。scene = c=<case_id>。"""
     if not _case_exists(case):
-        return JSONResponse({"error": "病例不存在"}, status_code=404)
+        return JSONResponse({"error": "数据不存在"}, status_code=404)
     cfg = _load_wx_config()
     ver = env_version or env or cfg.get("env_version", "release")
     if ver not in ("release", "trial", "develop"):
@@ -609,7 +609,7 @@ def wxacode(case: str, env: str = None, env_version: str = None):
 def qrcode(case: str, base: str = ""):
     """生成指向网页版深链的普通二维码(PNG)。base 为网页版访问地址，如 http://192.168.1.10:8000。"""
     if not _case_exists(case):
-        return JSONResponse({"error": "病例不存在"}, status_code=404)
+        return JSONResponse({"error": "数据不存在"}, status_code=404)
     try:
         import segno
     except ImportError:
