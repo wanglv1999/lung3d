@@ -103,7 +103,20 @@ body {
   background: #f6f8fa; cursor: pointer; font-size: 13px;
 }
 
-#viewport { flex: 1; position: relative; }
+.site-footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid #30363d;
+  font-size: 11px;
+  text-align: center;
+  position: sticky;
+  bottom: 0;
+  background: #161b22;
+}
+.site-footer a { color: #8b949e; text-decoration: none; }
+.site-footer a:hover { color: #58a6ff; text-decoration: underline; }
+
+#viewport { flex: 1; position: relative; touch-action: none; -webkit-touch-callout: none; }
 #viewport canvas { display: block; }
 
 @media (max-width: 640px) {

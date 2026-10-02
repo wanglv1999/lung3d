@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 const params = new URLSearchParams(location.search);
@@ -16,15 +15,18 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 document.getElementById('viewport').appendChild(renderer.domElement);
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-
 scene.add(new THREE.AmbientLight(0xffffff, 1.1));
 const dir = new THREE.DirectionalLight(0xffffff, 1.2);
 dir.position.set(200, 300, 200);
 scene.add(dir);
 scene.add(new THREE.DirectionalLight(0xffffff, 0.4).translateX(-200).translateY(-150).translateZ(-150));
+
+// 模型承载组：旋转 pivot 实现"相对视角固定"的旋转（与小程序的轨迹球一致）
+const pivot = new THREE.Group();
+scene.add(pivot);
+const modelGroup = new THREE.Group();
+pivot.add(modelGroup);
+const camTarget = new THREE.Vector3(0, 0, 0);
 
 const meshes = [];          // {key, group, visible}
 let fitBox = null;
@@ -41,18 +43,35 @@ function showError(msg) {
 function clearError() { $('error').hidden = true; }
 
 function fitCamera() {
-  if (!fitBox) return;
-  const box = fitBox.clone();
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
+  const savedPos = modelGroup.position.clone();
+  const savedQ = pivot.quaternion.clone();
+  modelGroup.position.set(0, 0, 0);
+  pivot.quaternion.identity();
+  pivot.updateMatrixWorld(true);
+  const box = new THREE.Box3();
+  modelGroup.traverse((o) => {
+    if (o.isMesh && o.visible) {
+      const b = new THREE.Box3().setFromObject(o);
+      if (!b.isEmpty()) box.union(b);
+    }
+  });
+  modelGroup.position.copy(savedPos);
+  pivot.quaternion.copy(savedQ);
+  if (box.isEmpty()) return;
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  // 模型中心移到原点，相机围绕原点旋转
+  modelGroup.position.set(-center.x, -center.y, -center.z);
+  camTarget.set(0, 0, 0);
   const maxDim = Math.max(size.x, size.y, size.z) || 1;
   const dist = maxDim * 1.9;
-  camera.position.set(center.x + dist * 0.7, center.y + dist * 0.6, center.z + dist);
+  camera.position.set(dist * 0.7, dist * 0.6, dist);
   camera.near = Math.max(0.1, maxDim / 10000);
   camera.far = maxDim * 50;
   camera.updateProjectionMatrix();
-  controls.target.copy(center);
-  controls.update();
+  camera.lookAt(camTarget);
 }
 
 function fitChanged() {
@@ -69,7 +88,7 @@ function fitChanged() {
 
 function addStructure(st) {
   const group = new THREE.Group();
-  scene.add(group);
+  modelGroup.add(group);
   const loader = new GLTFLoader();
   loader.load(apiBase + st.mesh, (gltf) => {
     gltf.scene.traverse((o) => {
@@ -99,7 +118,7 @@ function addStructure(st) {
 
 function addCt(meshUrl) {
   const group = new THREE.Group();
-  scene.add(group);
+  modelGroup.add(group);
   const loader = new GLTFLoader();
   loader.load(apiBase + meshUrl, (gltf) => {
     gltf.scene.traverse((o) => {
@@ -136,7 +155,6 @@ function renderStructRow(entry, st) {
     entry.visible = cb.checked;
     entry.group.visible = cb.checked;
     fitChanged();
-    fitCamera();
   });
   const name = document.createElement('span');
   name.className = 'sname';
@@ -160,12 +178,9 @@ function renderCase(info) {
   $('struct-list').innerHTML = '';
   meshes.length = 0;
   fitBox = null;
-  scene.clear();
-  scene.add(new THREE.AmbientLight(0xffffff, 1.1));
-  const d1 = new THREE.DirectionalLight(0xffffff, 1.2);
-  d1.position.set(200, 300, 200);
-  scene.add(d1);
-  scene.add(new THREE.DirectionalLight(0xffffff, 0.4).translateX(-200).translateY(-150).translateZ(-150));
+  pivot.quaternion.identity();
+  modelGroup.position.set(0, 0, 0);
+  while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
 
   if (info.ct_mesh) addCt(info.ct_mesh);
   for (const st of info.structures) addStructure(st);
@@ -185,14 +200,126 @@ function uploadFiles(files) {
       return data;
     })
     .then((info) => {
-      $('progress').hidden = true;
-      renderCase(info);
+      if (info && info.status === 'processing') {
+        waitCase(info.case_id, 0);
+      } else {
+        $('progress').hidden = true;
+        renderCase(info);
+      }
     })
     .catch((err) => {
       $('progress').hidden = true;
       showError('处理失败：' + err.message);
     });
 }
+
+let waitTimer = null;
+function waitCase(caseId, tries) {
+  $('progress').textContent = '处理中…请稍候';
+  fetch(apiBase + '/api/case/' + encodeURIComponent(caseId))
+    .then(async (r) => {
+      const data = await r.json().catch(() => null);
+      if (r.status === 200 && data && data.structures) {
+        $('progress').hidden = true;
+        renderCase(data);
+      } else if (r.status === 400 && data && data.error) {
+        $('progress').hidden = true;
+        showError(data.error);
+      } else if (tries > 90) {
+        $('progress').hidden = true;
+        showError('处理超时，请稍后重试');
+      } else {
+        waitTimer = setTimeout(() => waitCase(caseId, tries + 1), 2000);
+      }
+    })
+    .catch(() => {
+      $('progress').hidden = true;
+      showError('网络错误');
+    });
+}
+
+// ---------- 自定义鼠标控制：模型绕屏幕轴旋转（与小程序一致）----------
+const SPEED = 0.005;
+let drag = null;
+
+function orbit(dx, dy) {
+  const right = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0);
+  const up = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1);
+  const q = new THREE.Quaternion().setFromAxisAngle(up, dx * SPEED);
+  q.multiply(new THREE.Quaternion().setFromAxisAngle(right, dy * SPEED));
+  pivot.quaternion.premultiply(q);
+}
+function zoom(scale) {
+  const d = new THREE.Vector3().subVectors(camTarget, camera.position).normalize();
+  const dist = Math.max(camera.position.distanceTo(camTarget) * scale, 1);
+  camera.position.copy(camTarget).addScaledVector(d, -dist);
+  camera.lookAt(camTarget);
+}
+function pan(dx, dy) {
+  const k = 0.002 * camera.position.distanceTo(camTarget);
+  const right = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0).multiplyScalar(-dx * k);
+  const up = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1).multiplyScalar(dy * k);
+  const delta = right.add(up);
+  camTarget.add(delta);
+  camera.position.add(delta);
+}
+
+renderer.domElement.addEventListener('mousedown', (e) => {
+  if (e.button === 0) drag = { mode: 'orbit', x: e.clientX, y: e.clientY };
+  else if (e.button === 2) drag = { mode: 'pan', x: e.clientX, y: e.clientY };
+});
+window.addEventListener('mousemove', (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x;
+  const dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.mode === 'orbit') orbit(dx, dy);
+  else if (drag.mode === 'pan') pan(dx, dy);
+});
+window.addEventListener('mouseup', () => { drag = null; });
+renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+renderer.domElement.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoom(e.deltaY > 0 ? 1.1 : 1 / 1.1);
+}, { passive: false });
+let touchState = null;
+
+renderer.domElement.addEventListener('touchstart', (e) => {
+  const ts = e.touches;
+  if (ts.length >= 2) {
+    touchState = {
+      x1: ts[0].clientX, y1: ts[0].clientY,
+      x2: ts[1].clientX, y2: ts[1].clientY,
+      dist: Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY),
+    };
+  } else if (ts.length === 1) {
+    touchState = { x1: ts[0].clientX, y1: ts[0].clientY, dist: 0 };
+  }
+  e.preventDefault();
+}, { passive: false });
+
+renderer.domElement.addEventListener('touchmove', (e) => {
+  if (!touchState) return;
+  const ts = e.touches;
+  if (ts.length >= 2) {
+    const x2 = ts[1].clientX, y2 = ts[1].clientY;
+    const d = Math.hypot(ts[0].clientX - x2, ts[0].clientY - y2);
+    if (touchState.dist > 0) zoom(touchState.dist / Math.max(d, 1));
+    const dx = ((ts[0].clientX - touchState.x1) + (x2 - touchState.x2)) / 2;
+    const dy = ((ts[0].clientY - touchState.y1) + (y2 - touchState.y2)) / 2;
+    pan(dx, dy);
+    touchState.x1 = ts[0].clientX; touchState.y1 = ts[0].clientY;
+    touchState.x2 = x2; touchState.y2 = y2; touchState.dist = d;
+  } else if (ts.length === 1) {
+    const dx = ts[0].clientX - touchState.x1;
+    const dy = ts[0].clientY - touchState.y1;
+    orbit(dx, dy);
+    touchState.x1 = ts[0].clientX; touchState.y1 = ts[0].clientY;
+  }
+  e.preventDefault();
+}, { passive: false });
+
+renderer.domElement.addEventListener('touchend', () => { touchState = null; });
 
 $('file-input').addEventListener('change', (e) => uploadFiles(e.target.files));
 $('btn-upload-more').addEventListener('click', () => $('file-input').click());
@@ -215,7 +342,7 @@ async function showQr(url) {
     const blob = await r.blob();
     $('qr-img').src = URL.createObjectURL(blob);
     $('qr-img').style.display = 'block';
-    $('qr-hint').textContent = '用微信"扫一扫"打开';
+    $('qr-hint').textContent = '用微信“扫一扫”打开';
   } catch (e) {
     $('qr-hint').textContent = '生成失败：' + e.message;
   }
@@ -248,7 +375,7 @@ resize();
 
 (function animate() {
   requestAnimationFrame(animate);
-  controls.update();
+  camera.lookAt(camTarget);
   renderer.render(scene, camera);
 })();
 
