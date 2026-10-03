@@ -10,6 +10,7 @@
   4. 合并为统一标签体数据 combined.nii.gz
   5. 每个结构分别导出 STL(binary) / OBJ 三维模型
   6. 生成 report.json 体积报告 + 结节列表
+  7. 生成 labels.json 结构标注(显示名/配色/角色)，供查看端读取
 
 用法：
   单个病例:  python lung3d_reconstruct.py --input DICOM目录或.nii.gz --output 输出目录
@@ -138,6 +139,41 @@ LUNG_VESSEL_CLASSES = {
     "lung_airways": 3,
     "lung_airways_wall": 4,
 }
+NODULE_LABEL = 5
+
+# 结构标注表：key -> (显示名, RGB 配色, 处理角色)
+# 说明：这些名称属于「数据侧的标注信息」，会随 combined.nii.gz 一并写入输出目录的
+# labels.json。查看端（网页 / 小程序 / 移动端）不内置任何结构名称，一律读取该文件，
+# 从而让查看端保持为与领域无关的通用三维模型查看器。
+# role: vessel=管状结构(按管径剪除远端细支) / wall=管壁类(单独降采样且不平滑)
+#       其余取值(airway / lesion 等)仅作标注，处理上按普通结构对待。
+STRUCTURE_LABELS = {
+    "lung_arteries":     ("肺动脉",     [1.00, 0.20, 0.20], "vessel"),
+    "lung_veins":        ("肺静脉",     [0.20, 0.40, 1.00], "vessel"),
+    "lung_airways":      ("气管支气管", [0.20, 1.00, 0.30], "airway"),
+    "lung_airways_wall": ("气道壁",     [0.90, 0.60, 0.20], "wall"),
+    "lung_nodules":      ("肺结节",     [1.00, 1.00, 0.10], "lesion"),
+}
+
+
+def write_labels_json(case_dir, labels):
+    """把结构标注（显示名 / 配色 / 角色）写入 case_dir/labels.json，供查看端读取。
+
+    labels: {标签值: 结构key}，与 report.json 的 labels 字段一致。
+    未在 STRUCTURE_LABELS 中登记的结构，显示名回退为 key、配色由查看端自动分配。
+    """
+    items = []
+    for label, key in sorted(labels.items()):
+        name, color, role = STRUCTURE_LABELS.get(key, (key, None, ""))
+        item = {"label": int(label), "key": key, "name": name, "role": role}
+        if color:
+            item["color"] = list(color)
+        items.append(item)
+    path = Path(case_dir) / "labels.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"schema": "lung3d.labels/1", "structures": items}, f,
+                  ensure_ascii=False, indent=2)
+    return path
 
 
 def ts_device(device: str) -> str:
@@ -540,7 +576,7 @@ def process_case(case_input: Path, case_dir: Path, args):
     nifti = nib.load(str(nii_path))
     shape = nifti.shape
     affine = nifti.affine
-    combined = build_combined(masks, shape, affine, nodule_mask, nodule_label=5)
+    combined = build_combined(masks, shape, affine, nodule_mask, nodule_label=NODULE_LABEL)
     combined_path = case_dir / "combined.nii.gz"
     nib.save(nib.Nifti1Image(combined, affine), combined_path)
     log.append(f"  已保存 combined.nii.gz")
@@ -552,7 +588,7 @@ def process_case(case_input: Path, case_dir: Path, args):
     volumes = {}
     labels = {
         **{v: k for k, v in LUNG_VESSEL_CLASSES.items()},
-        5: "lung_nodules",
+        NODULE_LABEL: "lung_nodules",
     }
     for label, name in labels.items():
         m = combined == label
@@ -578,6 +614,9 @@ def process_case(case_input: Path, case_dir: Path, args):
     }
     with open(case_dir / "report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+
+    labels_path = write_labels_json(case_dir, labels)
+    log.append(f"  已保存 {labels_path.name}（结构标注，供查看端读取）")
 
     for line in log:
         print(line)

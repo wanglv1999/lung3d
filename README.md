@@ -7,7 +7,7 @@
 
 此外还附带：
 
-- **Web 后端**（`lung3d_api.py`，FastAPI）：上传已分割的 nii.gz / 病例 zip，提取各结构 GLB 网格供网页/小程序展示，并支持微信小程序码与二维码。
+- **Web 后端**（`lung3d_api.py`，FastAPI）：上传已分割的 nii.gz / 数据 zip，提取各结构 GLB 网格供网页/小程序展示，并支持微信小程序码与二维码。
 - **网页版查看器**（`web/`）：Three.js 实现的浏览器端 3D 查看器。
 - **微信小程序**（`miniprogram/`）：小程序端 3D 查看页面。
 - **MONAI 结节模型**（`monai_nodule/`）：LUNA16 预训练 RetinaNet 模型 bundle（Apache-2.0，来自 MONAI）。
@@ -22,6 +22,7 @@
 ├── lung3d_gui.py             # 软件一：分割重建图形界面（PySide6，推荐）
 ├── viewer3d.py               # 软件二：桌面 3D 查看器（VTK+PySide6）
 ├── lung3d_api.py             # Web 后端（FastAPI）
+├── lung3d_pack_data.py       # 数据打包工具（补 labels.json 并打包上传）
 ├── view_scene.py             # 3D Slicer 查看脚本（可选）
 ├── run_lung3d.bat            # 一键启动重建（命令行版）
 ├── run_lung3d_gui.bat        # 一键启动重建（图形界面版）
@@ -39,7 +40,7 @@
 ├── web/                      # 网页版 3D 查看器（Three.js）
 ├── miniprogram/              # 微信小程序端
 ├── deploy/                   # 云托管/镜像部署脚本
-└── web_output/               # Web 后端运行时病例输出（示例）
+└── web_output/               # Web 后端运行时数据输出（示例）
 ```
 
 ## 环境要求
@@ -73,14 +74,14 @@ PyTorch CUDA 版请按注释单独安装（见 `requirements.txt` 顶部说明�
 run_lung3d_gui.bat
 ```
 
-在界面中选择输入路径（DICOM 目录 / NIfTI 文件 / 含多病例的父目录均可）、输出目录，
+在界面中选择输入路径（DICOM 目录 / NIfTI 文件 / 含多数据的父目录均可）、输出目录，
 设置推理设备、快速模式、结节分数阈值等参数后点击「开始处理」，实时查看日志与进度。
 
 命令行批处理方式同样支持：
 
 ```bat
-run_lung3d.bat --input D:\病例\case01 --output .\output
-run_lung3d.bat --input D:\全部病例 --output .\output --device cuda --nodule-score 0.3
+run_lung3d.bat --input D:\数据\case01 --output .\output
+run_lung3d.bat --input D:\全部数据 --output .\output --device cuda --nodule-score 0.3
 ```
 
 常用选项：
@@ -95,22 +96,27 @@ run_lung3d.bat --input D:\全部病例 --output .\output --device cuda --nodule-
 | `--nodule-score` | 结节检测分数阈值（默认 0.3） |
 | `--nodule-model` | MONAI 结节模型目录（默认 `monai_nodule`） |
 
-输出结构（每个病例一个 `case_XXX_名称/` 目录）：
+输出结构（每个数据一个 `case_XXX_名称/` 目录）：
 
 ```
 case_001_case01/
 ├── ct.nii.gz                 # 转换后的 CT
 ├── combined.nii.gz           # 统一标签体数据：1肺动 2肺静 3气管 4气道壁 5结节
 ├── report.json               # 各结构体积(cm³) + 结节列表
+├── labels.json               # 结构标注（显示名/配色/角色），供查看端读取
 ├── seg_totalseg/             # TotalSegmentator 输出（*.nii.gz）
 └── mesh/                     # 各结构 STL/OBJ 三维模型
 ```
+
+> 结构名称不再写死在查看端。查看端（网页 / 小程序 / 移动端）一律从数据目录内的
+> `labels.json` 读取显示名与配色；缺少该文件时按标签序号显示为「结构 1、结构 2 …」。
+> 这样查看端保持为与领域无关的通用三维模型查看器。
 
 ### 2. 桌面 3D 查看器（软件二）
 
 ```bat
 run_viewer.bat                            # 弹出文件对话框
-run_viewer.bat D:\output\case_001_case01  # 直接打开病例目录
+run_viewer.bat D:\output\case_001_case01  # 直接打开数据目录
 run_viewer.bat D:\xxx\combined.nii.gz     # 或单个分割文件
 ```
 
@@ -130,9 +136,31 @@ run_web.bat
 
 启动后：
 
-- 网页版：打开 `http://localhost:8000`，上传 nii.gz 或病例 zip 即可在线查看 3D。
+- 网页版：打开 `http://localhost:8000`，上传 nii.gz 或数据 zip 即可在线查看 3D。
 - 接口：`POST /api/process`、`GET /api/case/{id}`、`GET /api/mesh/{case_id}/{name}.glb`、`GET /api/cases`。
 - 微信小程序码：将真实 `appid/secret` 写入 `wx_config.json`（模板见 `wx_config.example.json`），调用 `GET /api/wxacode?case=<id>`。**请勿把真实密钥提交到 git。**
+
+### 4. 数据目录打包（`lung3d_pack_data.py`）
+
+把一份已分割的多标签体数据整理成查看端可直接上传的目录，并补齐 `labels.json`：
+
+```bat
+:: 单份数据，补标注并打包
+python lung3d_pack_data.py --input combined.nii.gz --name 示例数据 --zip
+
+:: 已有输出目录，沿用其中的 labels.json
+python lung3d_pack_data.py --input .\lung3d_output\case_001 --name 示例数据 --zip
+
+:: 批量：目录下每个 *.nii.gz 各打一包
+python lung3d_pack_data.py --input .\nii_dir --batch --zip
+
+:: 只写 key，不写显示名（查看端显示「结构 1 / 2 / 3 …」）
+python lung3d_pack_data.py --input combined.nii.gz --name 示例数据 --generic
+```
+
+产出目录（`web_output/packed/<name>/`）含 `combined.nii.gz` / `labels.json` / `report.json`；
+加 `--zip` 会额外生成 `<name>.zip`，直接在网页端或小程序上传即可。
+用途：历史产物补标注、把裸体数据转成可上传格式。
 
 ## 3D Slicer 微调
 
@@ -142,7 +170,7 @@ run_web.bat
 
 - **显存不足**：重建时加 `--fast`，或将 `--device cpu`。
 - **查看器白屏**：更新显卡驱动，确保 OpenGL 3.2+。
-- **Web 上传超时**：大 nii.gz 请先压缩为病例 zip 再上传。
+- **Web 上传超时**：大 nii.gz 请先压缩为数据 zip 再上传。
 
 ## 版权与许可
 

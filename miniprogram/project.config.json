@@ -1,5 +1,5 @@
 {
-  "description": "Lung3D 肺部分割三维查看 - 微信小程序",
+  "description": "Lung3D 三维模型查看 - 微信小程序",
   "projectname": "lung3d-miniprogram",
   "appid": "wx9bf51217a85c8560",
   "compileType": "miniprogram",

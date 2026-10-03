@@ -63,7 +63,7 @@ Page({
     if (this.info.spacing_mm) meta.push('体素 ' + this.info.spacing_mm.map((v) => v.toFixed(1)).join('×') + 'mm')
     const structures = []
     if (this.info.ct_mesh) {
-      structures.push({ key: '__ct__', name: 'CT轮廓', color: 'rgb(136,146,160)', checked: true })
+      structures.push({ key: '__ct__', name: '体数据轮廓', color: 'rgb(136,146,160)', checked: true })
     }
     for (const s of this.info.structures) {
       structures.push({

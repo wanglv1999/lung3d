@@ -3,7 +3,7 @@
 venv
 __pycache__
 *.pyc
-web_output
+web_output*
 miniprogram
 deploy
 *.bat

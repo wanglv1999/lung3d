@@ -12,7 +12,7 @@ Lung3D Web 后端服务（FastAPI）
   POST /api/process     上传文件(multipart: files)。支持:
                          - 单个多标签分割 nii.gz(自动按标签拆分)
                          - 单个二值 nii.gz(文件名作为结构名)
-                         - 病例目录 zip(ct.nii.gz/combined.nii.gz/seg_totalseg/*/report.json)
+                         - 病例目录 zip(ct.nii.gz/combined.nii.gz/seg_totalseg/*/report.json/labels.json)
                          - 多个 nii.gz 同时上传(各自为独立结构)
   GET  /api/case/{id}   读取某病例 report.json
   GET  /api/mesh/{case_id}/{name}.glb   下载网格
@@ -26,6 +26,11 @@ Lung3D Web 后端服务（FastAPI）
     "secret": "...",             # 小程序 AppSecret
     "env_version": "release"     # release/trial/develop
   }
+
+结构命名（外部化）：
+  本服务不内置任何领域结构名称。显示名 / 配色 / 处理角色来自数据目录内的
+  labels.json（或 structures.json），也可用环境变量 STRUCTURE_LABELS 指定外部文件。
+  二者都缺失时，按标签序号生成中性名称「结构 N」并自动分配配色。
 """
 import argparse
 import base64
@@ -33,6 +38,7 @@ import gc
 import io
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -56,26 +62,109 @@ OUTPUT_DIR = ROOT / "web_output" / "cases"
 MAX_CONCURRENT_PROCESSING = max(1, int(os.environ.get("MAX_CONCURRENT_PROCESSING", "1")))
 _PROCESS_SEM = threading.BoundedSemaphore(MAX_CONCURRENT_PROCESSING)
 
-STRUCTURES = [
-    dict(key="lung_arteries", name="肺动脉", color=[1.00, 0.20, 0.20]),
-    dict(key="lung_veins", name="肺静脉", color=[0.20, 0.40, 1.00]),
-    dict(key="lung_airways", name="气管支气管", color=[0.20, 1.00, 0.30]),
-    dict(key="lung_airways_wall", name="气道壁", color=[0.90, 0.60, 0.20]),
-    dict(key="lung_nodules", name="肺结节", color=[1.00, 1.00, 0.10]),
-]
-LABEL_MAP = {
-    1: "lung_arteries",
-    2: "lung_veins",
-    3: "lung_airways",
-    4: "lung_airways_wall",
-    5: "lung_nodules",
-}
+# ---------------------------------------------------------------------------
+# 结构标注（外部化，服务本身不内置任何领域名词）
+# ---------------------------------------------------------------------------
+# 本服务是通用的三维模型生成 / 分发后端，不内置任何具体领域的结构名称。
+# 结构的显示名、配色、处理角色全部来自「数据侧」提供的标注配置：
+#   1) 上传的数据目录内的 labels.json / structures.json（推荐，随数据走）
+#   2) 环境变量 STRUCTURE_LABELS 指向的外部配置文件（运维侧可选）
+# 两者都没有时，按标签序号生成中性名称（结构 1、结构 2 …）并自动分配配色。
+LABELS_FILENAMES = ("labels.json", "structures.json")
+LABELS_ENV = "STRUCTURE_LABELS"
+
+# 处理角色：由标注配置的 role 字段声明，缺省空串（按普通结构处理）。
+#   vessel —— 管状结构，按管径阈值剪除远端细支后重建
+#   wall   —— 管壁类结构，单独降采样且不做平滑，保留细节
+ROLE_VESSEL = "vessel"
+ROLE_WALL = "wall"
+
 PALETTE = [
     [1.0, 0.5, 0.2], [0.5, 0.2, 1.0], [0.2, 0.9, 0.9],
     [0.9, 0.4, 0.8], [0.6, 0.8, 0.2], [0.4, 0.6, 1.0],
 ]
 
-app = FastAPI(title="Lung3D API", version="1.0")
+
+def default_structure_name(key):
+    """中性结构名：label_3 -> 结构 3；其余（由文件名派生）原样使用。"""
+    m = re.fullmatch(r"label_(\d+)", str(key))
+    return "结构 %s" % m.group(1) if m else str(key)
+
+
+def empty_label_config():
+    return {"by_label": {}, "by_key": {}}
+
+
+def parse_label_config(path):
+    """解析结构标注配置。成功返回 {"by_label": {int: st}, "by_key": {str: st}}，失败返回 None。
+
+    格式（structures 列表的先后顺序即缺省 label 顺序）：
+      {
+        "schema": "lung3d.labels/1",
+        "structures": [
+          {"label": 1, "key": "s1", "name": "结构 1",
+           "color": [1.0, 0.5, 0.2], "role": "vessel"}
+        ]
+      }
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    items = raw.get("structures") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return None
+    by_label, by_key = {}, {}
+    for i, it in enumerate(items, start=1):
+        if not isinstance(it, dict):
+            continue
+        try:
+            label = int(it.get("label", i))
+        except Exception:
+            label = i
+        key = str(it.get("key") or ("label_%d" % label))
+        color = it.get("color")
+        if isinstance(color, (list, tuple)) and len(color) == 3:
+            try:
+                color = [float(c) for c in color]
+            except Exception:
+                color = None
+        else:
+            color = None
+        st = {
+            "key": key,
+            "name": str(it.get("name") or default_structure_name(key)),
+            "color": color,
+            "role": str(it.get("role") or ""),
+        }
+        by_label[label] = st
+        by_key.setdefault(key, st)
+    return {"by_label": by_label, "by_key": by_key}
+
+
+def load_label_config(*roots):
+    """按顺序在给定目录中查找标注配置，再回退到 STRUCTURE_LABELS 环境变量。
+
+    返回 {"by_label": ..., "by_key": ...}；一处都找不到时返回空配置
+    （调用方据此生成中性结构名）。
+    """
+    cands = []
+    for r in roots:
+        if r:
+            cands.extend(Path(r) / fn for fn in LABELS_FILENAMES)
+    env_path = os.environ.get(LABELS_ENV, "").strip()
+    if env_path:
+        cands.append(Path(env_path))
+    for p in cands:
+        if p.is_file():
+            cfg = parse_label_config(p)
+            if cfg is not None:
+                print("[Lung3D] structure labels loaded from", p)
+                return cfg
+    return empty_label_config()
+
+
+app = FastAPI(title="Lung3D API", version="1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -204,10 +293,15 @@ def nifti_is_segmentation(img):
     return True
 
 
-def masks_from_nifti(path, base_name):
-    """返回 {key: (bool_mask, affine)}。多标签按 LABEL_MAP/数值拆分，二值作为单结构。"""
+def masks_from_nifti(path, base_name, label_cfg=None):
+    """返回 {key: (bool_mask, affine)}。
+
+    多标签体数据按标注配置拆分（配置里没有的标签用 label_<数值>），
+    二值体数据作为单个结构，键名取自文件名。
+    """
     import nibabel as nib
 
+    by_label = (label_cfg or {}).get("by_label", {})
     img = nib.load(str(path))
     data = np.asarray(img.dataobj)
     if data.ndim != 3:
@@ -217,7 +311,8 @@ def masks_from_nifti(path, base_name):
     out = {}
     if len(labels) > 1:
         for lab in labels:
-            key = LABEL_MAP.get(int(lab), f"label_{int(lab)}")
+            st = by_label.get(int(lab))
+            key = st["key"] if st else ("label_%d" % int(lab))
             out[key] = ((data == lab), img.affine)
     else:
         key = base_name[:-7] if base_name.lower().endswith(".nii.gz") else Path(base_name).stem
@@ -246,15 +341,19 @@ def load_report_json(case_dir):
 
 
 def extract_from_case_dir(case_dir):
-    """从病例目录收集：masks / ct / report。返回 (masks, ct_or_None, ct_affine, report)。"""
+    """从数据目录收集：masks / ct / report / 标注配置。
+
+    返回 (masks, ct_or_None, ct_affine, report, label_cfg)。
+    """
     case_dir = Path(case_dir)
+    label_cfg = load_label_config(case_dir)
     masks = {}
     affine = None
     ct_data, ct_affine = None, None
 
     combined = case_dir / "combined.nii.gz"
     if combined.exists():
-        res = masks_from_nifti(combined, "combined.nii.gz")
+        res = masks_from_nifti(combined, "combined.nii.gz", label_cfg)
         if res:
             for k, (m, a) in res.items():
                 masks[k] = (m, a)
@@ -292,20 +391,21 @@ def extract_from_case_dir(case_dir):
     report = load_report_json(case_dir)
     if affine is None and ct_affine is not None:
         affine = ct_affine
-    return masks, ct_data, ct_affine, report
+    return masks, ct_data, ct_affine, report, label_cfg
 
 
 # ---------------------------------------------------------------------------
 # 构建病例
 # ---------------------------------------------------------------------------
-def build_case(case_dir, masks, ct_data, ct_affine, report):
+def build_case(case_dir, masks, ct_data, ct_affine, report, label_cfg=None):
     case_dir = Path(case_dir)
     mesh_dir = case_dir / "meshes"
     mesh_dir.mkdir(parents=True, exist_ok=True)
 
     affine = None
     structures = []
-    palette_iter = iter(PALETTE)
+    by_key = (label_cfg or {}).get("by_key", {})
+    palette_idx = 0
     try:
         distal_prune_mm = float(os.environ.get("DISTAL_PRUNE_MM", "0.75"))
     except Exception:
@@ -324,13 +424,18 @@ def build_case(case_dir, masks, ct_data, ct_affine, report):
             continue
         if affine is None:
             affine = a
-        st = next((s for s in STRUCTURES if s["key"] == key), None)
-        name = st["name"] if st else key
-        color = st["color"] if st else next(palette_iter)
-        if key == "lung_airways_wall":
+        st = by_key.get(key)
+        name = st["name"] if st else default_structure_name(key)
+        if st and st.get("color"):
+            color = st["color"]
+        else:
+            color = PALETTE[palette_idx % len(PALETTE)]
+            palette_idx += 1
+        role = st.get("role", "") if st else ""
+        if role == ROLE_WALL:
             mesh = mask_to_trimesh(m, a, ds_factor=ds_wall, smooth=0)
         else:
-            prune_mm = distal_prune_mm if key in ("lung_arteries", "lung_veins") else 0.0
+            prune_mm = distal_prune_mm if role == ROLE_VESSEL else 0.0
             mesh = mask_to_trimesh(m, a, ds_factor=ds_env, prune_mm=prune_mm)
         if mesh is None:
             continue
@@ -380,17 +485,18 @@ def _process_upload_worker(case_dir, case_name):
         try:
             tmp = case_dir / "upload"
             masks, ct_data, ct_affine, report = {}, None, None, {}
+            label_cfg = load_label_config(tmp, case_dir)
             for p in sorted(tmp.iterdir()):
                 fname = p.name
                 if fname.lower().endswith(".zip"):
                     with zipfile.ZipFile(p) as z:
                         z.extractall(tmp / "_zip")
-                    masks, ct_data, ct_affine, report = extract_from_case_dir(tmp / "_zip")
+                    masks, ct_data, ct_affine, report, label_cfg = extract_from_case_dir(tmp / "_zip")
                     break
                 elif fname.lower().endswith((".nii", ".nii.gz")):
                     img = load_nifti(p)
                     if nifti_is_segmentation(img):
-                        res = masks_from_nifti(p, fname)
+                        res = masks_from_nifti(p, fname, label_cfg)
                         if res:
                             masks.update(res)
                     else:
@@ -406,7 +512,7 @@ def _process_upload_worker(case_dir, case_name):
                     "无法识别文件：需要分割 nii.gz、多标签 nii.gz 或数据目录 zip。收到: " + "; ".join(files_info),
                     encoding="utf-8")
                 return
-            case_info = build_case(case_dir, masks, ct_data, ct_affine, report)
+            case_info = build_case(case_dir, masks, ct_data, ct_affine, report, label_cfg)
             if not case_info["structures"] and case_info["ct_mesh"] is None:
                 (case_dir / "error.txt").write_text("未提取到任何结构网格", encoding="utf-8")
                 return
