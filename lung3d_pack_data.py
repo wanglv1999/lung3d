@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - 单文件分发时的兜底
     NODULE_LABEL = 5
     STRUCTURE_LABELS = {
         "lung_arteries": ("肺动脉", [0.20, 0.40, 1.00], "vessel"),
-        "lung_veins": ("肺静脉", [0.55, 0.10, 0.10], "vessel"),
+        "lung_veins": ("肺静脉", [0.85, 0.17, 0.17], "vessel"),
         "lung_airways": ("气管",       [0.20, 1.00, 0.30], "airway"),
         "lung_airways_wall": ("气道壁", [0.90, 0.60, 0.20], "wall"),
         "lung_nodules": ("肺结节", [1.00, 1.00, 0.10], "lesion"),
