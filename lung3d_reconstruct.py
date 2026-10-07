@@ -33,6 +33,9 @@ import numpy as np
 
 # 减少 PyTorch CUDA 显存碎片化（需在 torch 初始化 CUDA 前设置）
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# nnU-Net 预处理 worker 数：必须在 import nnunetv2 之前设置（其 configuration 模块在导入时读取）
+os.environ.setdefault("nnUNet_def_n_proc", "2")
+os.environ.setdefault("nnUNet_def_n_proc_export", "2")
 
 DEVICE_DEFAULT = "cuda"
 
@@ -90,26 +93,109 @@ def find_dicom_cases(root: Path):
     return cases
 
 
+def _pick_best_series_file(dicom_dir: Path, series_uid: str = ""):
+    """挑选用于重建的 DICOM 序列文件列表。
+
+    背景：一个病例目录里常含定位像/多种序列（本次问题：910 个文件分属 4 个
+    SeriesInstanceUID）。SimpleITK 的 GetGDCMSeriesFileNames 在含中文路径或
+    多序列时可能只返回 1 个文件，导致读出 (X, Y, 1) 全 0 的空体数据，
+    后续分割必然失败。
+
+    策略：
+      1. 若指定 series_uid，直接取该序列；
+      2. 用 pydicom 统计所有序列，按「文件数最多」优先（真 CT 序列切片数远多于定位像），
+         同数时取像素非空者；
+      3. 同一序列内按 ImagePositionPatient / InstanceNumber 排序，保证层序正确；
+      4. 过滤掉没有像素位置信息、像素全 0 的定位像序列。
+    """
+    files = sorted(p for p in dicom_dir.iterdir() if p.is_file() and is_dicom_file(p))
+    if not files:
+        return []
+    if series_uid:
+        selected = []
+        for p in files:
+            try:
+                import pydicom
+                if getattr(pydicom.dcmread(str(p), stop_before_pixels=True), "SeriesInstanceUID",
+                           None) == series_uid:
+                    selected.append(p)
+            except Exception:
+                pass
+        return _sort_series_files(selected)
+
+    groups = {}
+    for p in files:
+        try:
+            import pydicom
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True)
+        except Exception:
+            continue
+        uid = getattr(ds, "SeriesInstanceUID", None)
+        groups.setdefault(uid, []).append((p, ds))
+
+    def series_rank(item):
+        _, ds = item
+        ipp = getattr(ds, "ImagePositionPatient", None)
+        return (0 if ipp else 1, 0 if int(getattr(ds, "Rows", 0) or 0) > 1 else 1)
+
+    best = None
+    for uid, items in groups.items():
+        items.sort(key=series_rank)
+        # 定位像通常只有 1 个文件；优先选文件数最多的序列
+        cand = (len(items), -sum(series_rank(i)[0] for i in items), uid or "")
+        if best is None or cand > best[0]:
+            best = (cand, items)
+    if best is None:
+        return []
+    return _sort_series_files([p for p, _ in best[1]])
+
+
+def _sort_series_files(paths):
+    """按 InstanceNumber / ImagePositionPatient 的 z 分层排序。"""
+    import numpy as np
+    import pydicom
+
+    def key(p):
+        try:
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True)
+        except Exception:
+            return (0, 0.0)
+        inst = getattr(ds, "InstanceNumber", None)
+        inst = float(inst) if inst not in (None, "") else 0.0
+        ipp = getattr(ds, "ImagePositionPatient", None)
+        z = float(ipp[2]) if ipp is not None and len(ipp) >= 3 else 0.0
+        return (inst, z)
+
+    try:
+        return sorted(paths, key=key)
+    except Exception:
+        return paths
+
+
 def dicom_to_nifti(dicom_dir: Path, out_nii: Path, series_uid: str = ""):
     import shutil
     import tempfile
     import SimpleITK as sitk
 
-    if series_uid:
-        reader = sitk.ImageSeriesReader()
-        reader.MetaDataDictionaryArrayUpdateOn()
-        reader.LoadPrivateTagsOn()
-        reader.SetFileNames(reader.GetGDCMSeriesFileNames(str(dicom_dir), series_uid))
-    else:
-        reader = sitk.ImageSeriesReader()
-        reader.MetaDataDictionaryArrayUpdateOn()
-        reader.LoadPrivateTagsOn()
-        reader.SetFileNames(sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(dicom_dir)))
-    if reader.GetFileNames():
+    file_list = _pick_best_series_file(dicom_dir, series_uid)
+    reader = sitk.ImageSeriesReader()
+    reader.MetaDataDictionaryArrayUpdateOn()
+    reader.LoadPrivateTagsOn()
+    if file_list:
+        reader.SetFileNames([str(p) for p in file_list])
         img = reader.Execute()
     else:
         # 退化为直接读取目录（部分未标号数据）
         img = sitk.ReadImage(str(dicom_dir))
+
+    # 自检：空体数据（形状含 1 或像素全 0）说明序列选择失败，直接报错更明确
+    import numpy as np
+    arr = sitk.GetArrayFromImage(img)
+    if arr.ndim != 3 or arr.shape[2] < 8 or not np.any(arr):
+        raise ValueError(
+            f"DICOM 序列读取异常：得到体数据形状 {arr.shape}（层数过少或像素全 0）。\n"
+            f"该目录可能含多个序列/定位像，请在 3D Slicer 中确认正确的 CT 序列，"
+            f"或用单序列的 nii.gz 输入。")
 
     # ITK 的 nifti C 库无法写入含非 ASCII(如中文)字符的路径，
     # 因此先写到 ASCII 临时目录，再用 Python(Unicode 安全)复制到目标路径。
@@ -181,11 +267,26 @@ def ts_device(device: str) -> str:
     return "gpu" if device == "cuda" else "cpu"
 
 
+def _limit_nnunet_workers(n: int):
+    """限制 nnU-Net 预处理后台进程数。
+
+    nnU-Net 默认按 CPU 核数开启多个预处理 worker，每个 worker 会把整个 CT
+    体数据载入内存；层数多/体素大的 CT（如 900+ 层）会直接把内存耗尽，
+    导致 "Background workers died"。这里通过环境变量强制限制为 n。
+    """
+    os.environ["nnUNet_def_n_proc"] = str(max(1, int(n)))
+    os.environ.setdefault("nnUNet_def_n_proc_export", str(max(1, int(n))))
+
+
 def run_lung_vessels(nii_path: Path, seg_dir: Path, device: str, fast: bool):
     from totalsegmentator.python_api import totalsegmentator
 
     seg_dir.mkdir(parents=True, exist_ok=True)
+    # 默认把 nnU-Net 后台 worker 限制为 2 个，避免大体积 CT 预处理时爆内存
+    _limit_nnunet_workers(int(os.environ.get("LUNG3D_NNUNET_PROC", "2")))
+
     t0 = time.time()
+    nr_thr_resamp = int(os.environ.get("LUNG3D_NR_THR_RESAMP", "1"))
     totalsegmentator(
         str(nii_path),
         str(seg_dir),
@@ -194,6 +295,7 @@ def run_lung_vessels(nii_path: Path, seg_dir: Path, device: str, fast: bool):
         fast=fast,
         nora_tag=True,
         quiet=True,
+        nr_thr_resamp=nr_thr_resamp,
     )
     elapsed = time.time() - t0
     masks = {}
