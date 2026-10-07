@@ -217,7 +217,7 @@ class ReconstructWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lung3D 分割重建 v1.3.1")
+        self.setWindowTitle("Lung3D 分割重建 v1.3.2")
         self.resize(920, 640)
 
         self.settings = QSettings("Lung3D", "ReconstructGUI")

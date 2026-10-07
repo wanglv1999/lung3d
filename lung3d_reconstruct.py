@@ -151,26 +151,157 @@ def _pick_best_series_file(dicom_dir: Path, series_uid: str = ""):
     return _sort_series_files([p for p, _ in best[1]])
 
 
+def _slice_normal(iop):
+    """由 ImageOrientationPatient 求层法向(row_dir × col_dir)，即体数据 k 轴方向。"""
+    if iop is None or len(iop) < 6:
+        return None
+    r = np.asarray(iop[:3], dtype=float)
+    c = np.asarray(iop[3:6], dtype=float)
+    n = np.cross(r, c)
+    ln = float(np.linalg.norm(n))
+    if not np.isfinite(ln) or ln < 1e-6:
+        return None
+    return n / ln
+
+
 def _sort_series_files(paths):
-    """按 InstanceNumber / ImagePositionPatient 的 z 分层排序。"""
-    import numpy as np
+    """按「层在体数据 k 轴上的物理位置」升序排列切片文件。
+
+    ⚠️ 为什么不能只按 InstanceNumber 排：
+    SimpleITK/ITK 的 ImageSeriesReader 会用我们给出的文件顺序组装体数据，
+    但 direction 的第 3 列取自 ImageOrientationPatient 的叉乘 —— 它对同一台设备
+    恒定（轴位即 +z），**不随实际层间距的正负而变**。所以当数据的编号方向与
+    层法向相反时（编号增大 z 反而减小，即「自头向足编号」，如西门子光子计数 CT
+    NAEOTOM Alpha），就会得到「像素层序与 affine 声明相反」的体数据：affine 的 z
+    符号错误，整卷上下镜像，进而使分割、结节检测、网格导出全部上下颠倒。
+    对「自足向头编号」的常规 CT 不会暴露，因此以前一直没被发现。
+
+    正确做法：一律按物理层位置(IPP 在层法向上的投影)升序排列，使
+        k 增大 -> 沿层法向(轴位即朝头侧)前进
+    与 ITK 的 direction 自洽。对常规 CT，该排序结果与按 InstanceNumber 排序完全一致，
+    行为不变（不会改坏本来正确的病例）。
+
+    IOP/IPP 缺失或投影退化(所有层投影相同)时，退回按 (InstanceNumber, z) 排序。
+    """
     import pydicom
 
-    def key(p):
+    metas = []
+    for p in paths:
+        ds = None
         try:
             ds = pydicom.dcmread(str(p), stop_before_pixels=True)
         except Exception:
-            return (0, 0.0)
-        inst = getattr(ds, "InstanceNumber", None)
+            pass
+        inst = getattr(ds, "InstanceNumber", None) if ds is not None else None
         inst = float(inst) if inst not in (None, "") else 0.0
-        ipp = getattr(ds, "ImagePositionPatient", None)
+        ipp = getattr(ds, "ImagePositionPatient", None) if ds is not None else None
+        iop = getattr(ds, "ImageOrientationPatient", None) if ds is not None else None
+        metas.append((p, inst, ipp, iop))
+
+    normal = None
+    for _, _, _, iop in metas:
+        normal = _slice_normal(iop)
+        if normal is not None:
+            break
+
+    has_ipp = normal is not None and all(
+        ipp is not None and len(ipp) >= 3 and np.all(np.isfinite(np.asarray(ipp[:3], dtype=float)))
+        for _, _, ipp, _ in metas)
+    if has_ipp:
+        proj = [float(np.dot(np.asarray(ipp[:3], dtype=float), normal))
+                for _, _, ipp, _ in metas]
+        if max(proj) - min(proj) > 1e-3:          # 投影确有区分度 -> 按物理位置升序
+            order = sorted(range(len(metas)), key=lambda i: (proj[i], metas[i][1]))
+            return [metas[i][0] for i in order]
+
+    # 退化：保留原行为 —— 按 (InstanceNumber, IPP z) 升序
+    def key(i):
+        _, inst, ipp, _ = metas[i]
         z = float(ipp[2]) if ipp is not None and len(ipp) >= 3 else 0.0
         return (inst, z)
 
     try:
-        return sorted(paths, key=key)
+        order = sorted(range(len(metas)), key=key)
+        return [metas[i][0] for i in order]
     except Exception:
         return paths
+
+
+def _layer_order_note(file_list):
+    """给出层序描述：编号方向 + 体数据 k 轴实际朝向，便于日志一眼确认。"""
+    import pydicom
+
+    try:
+        insts, zs = [], []
+        for p in file_list:
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True)
+            insts.append(int(ds.InstanceNumber))
+            zs.append(float(ds.ImagePositionPatient[2]))
+    except Exception:
+        return None
+    if len(file_list) < 2:
+        return None
+
+    i_lo, i_hi = int(np.argmin(insts)), int(np.argmax(insts))
+    if zs[i_lo] > zs[i_hi] + 1e-6:
+        num_dir = "自头向足"
+    elif zs[i_lo] < zs[i_hi] - 1e-6:
+        num_dir = "自足向头"
+    else:
+        num_dir = "无法判定(编号与 z 无对应)"
+    axis = "朝头侧(升 z)" if zs[-1] > zs[0] else "朝足侧(降 z)"
+    return (f"层序自检: {len(file_list)} 层, 编号{num_dir}; "
+            f"已按物理层位置升序排列 -> k 轴 {axis}, "
+            f"第1层 z={zs[0]:.2f} 第{len(file_list)}层 z={zs[-1]:.2f}")
+
+
+def _verify_slice_geometry(img, file_list, tol_mm=1.0):
+    """校验体数据 k 轴的几何声明是否与文件层序一致，必要时翻转纠正。
+
+    ITK 的 direction 第 3 列由 IOP 叉乘决定，与实际层间距正负无关；若文件层序
+    与法向相反（见 _sort_series_files 说明），体素层序就会与 affine 声明相反。
+    这里用首末层的 ImagePositionPatient 实测物理位置校验；不自洽且 k 轴近似
+    z 向时，翻转 direction 的 z 列予以纠正（ITK 的 origin 恰为第 0 层的物理位置，
+    翻转后即自洽）。返回 None 表示正常，否则返回说明字符串。
+    """
+    import pydicom
+
+    if not file_list or len(file_list) < 2:
+        return None
+    try:
+        d0 = pydicom.dcmread(str(file_list[0]), stop_before_pixels=True)
+        dN = pydicom.dcmread(str(file_list[-1]), stop_before_pixels=True)
+        ipp0 = np.asarray(d0.ImagePositionPatient, dtype=float)
+        ippN = np.asarray(dN.ImagePositionPatient, dtype=float)
+    except Exception:
+        return None
+
+    nz = img.GetSize()[2]
+    p0 = np.asarray(img.TransformIndexToPhysicalPoint((0, 0, 0)), dtype=float)
+    pN = np.asarray(img.TransformIndexToPhysicalPoint((0, 0, nz - 1)), dtype=float)
+    err0 = float(np.linalg.norm(p0 - ipp0))
+    errN = float(np.linalg.norm(pN - ippN))
+    if err0 <= tol_mm and errN <= tol_mm:
+        return None
+
+    d = np.asarray(img.GetDirection(), dtype=float).reshape(3, 3)
+    if abs(d[2, 2]) < 0.9:      # k 轴非 z 向，翻转 z 列无意义
+        return (f"[方向自检] 体素层序与 affine 不自洽(首层偏差 {err0:.1f}mm/末层偏差 {errN:.1f}mm)，"
+                f"且 k 轴非 z 向(dir_z={d[2, 2]:.2f})，无法自动纠正，请核查层序！")
+
+    d2 = d.copy()
+    d2[:, 2] *= -1.0
+    img.SetDirection(tuple(float(v) for v in d2.ravel()))
+    q0 = np.asarray(img.TransformIndexToPhysicalPoint((0, 0, 0)), dtype=float)
+    qN = np.asarray(img.TransformIndexToPhysicalPoint((0, 0, nz - 1)), dtype=float)
+    if (float(np.linalg.norm(q0 - ipp0)) <= tol_mm
+            and float(np.linalg.norm(qN - ippN)) <= tol_mm):
+        return (f"[方向自检] 检出体素层序与 affine 相反(首层偏差 {err0:.1f}mm/末层偏差 {errN:.1f}mm)，"
+                f"已翻转 k 轴方向予以纠正")
+
+    img.SetDirection(tuple(float(v) for v in d.ravel()))    # 纠正无效 -> 复原
+    return (f"[方向自检] 体素层序与 affine 不自洽且自动纠正无效"
+            f"(首层偏差 {err0:.1f}mm/末层偏差 {errN:.1f}mm)，请核查数据层序！")
 
 
 def dicom_to_nifti(dicom_dir: Path, out_nii: Path, series_uid: str = "",
@@ -193,6 +324,13 @@ def dicom_to_nifti(dicom_dir: Path, out_nii: Path, series_uid: str = "",
     if file_list:
         reader.SetFileNames([str(p) for p in file_list])
         img = reader.Execute()
+        # 方向自检：确认体素层序与 affine 声明一致（防整卷上下镜像）
+        note = _verify_slice_geometry(img, file_list)
+        if note:
+            print("  " + note)
+        summary = _layer_order_note(file_list)
+        if summary:
+            print("  " + summary)
     else:
         # 退化为直接读取目录（部分未标号数据）
         img = sitk.ReadImage(str(dicom_dir))
@@ -381,6 +519,48 @@ def run_lung_vessels(nii_path: Path, seg_dir: Path, device: str, fast: bool):
 # ---------------------------------------------------------------------------
 # 2) MONAI 肺结节检测
 # ---------------------------------------------------------------------------
+# 滑窗 roi 候选项：由大到小，上限即官方 bundle 的 512×512×192。
+_SW_ROI_LADDER = ((512, 512, 192), (512, 512, 128), (512, 512, 96), (512, 512, 64), (256, 256, 64))
+# 显存占用经验模型（本机 8GB 卡同一进程内实测两点拟合；峰值≈固定开销+随窗口体素线性增长的激活）：
+#   roi 512×512×192 (50.3M 体素) -> torch 峰值 8.75GB（> 卡上 7.96GB，溢出导致抖动）
+#   roi 512×512×96  (25.2M 体素) -> torch 峰值 4.73GB
+#   peak_GB ≈ 0.70 + 0.160 × (roi 体素数 / 1e6)
+_SW_PEAK_INTERCEPT_GB = 0.70
+_SW_PEAK_PER_MVOX_GB = 0.160
+# 允许占用的显存比例：留足余量，避免接近上限后 PyTorch 分配器抖动
+_SW_PEAK_BUDGET_FRACTION = 0.60
+
+
+def _estimate_sw_peak_gb(roi):
+    return _SW_PEAK_INTERCEPT_GB + _SW_PEAK_PER_MVOX_GB * (roi[0] * roi[1] * roi[2] / 1e6)
+
+
+def _pick_sliding_window_roi():
+    """按可用显存挑选滑窗 roi，上限为官方 bundle 的 512×512×192。
+
+    为什么必须按显存调：8GB 卡上官方 roi 的 torch 峰值显存达 8.75GB，**超过了卡上可用的 7.96GB**，
+    分配给 PyTorch 的显存被压到接近上限后调度严重抖动（本机 Windows 上 expandable_segments
+    不被支持，启动时有告警），同一份数据一次滑窗前向实测 744.3s；把 roi 缩到 512×512×96
+    （总计算量不变，只是窗口更小）后峰值 4.73GB，只要 29.4s（约 25 倍），
+    且前 6 个检出框与官方 roi 完全一致。
+    显存充裕时仍使用官方 roi，行为不变。
+    """
+    import torch
+
+    try:
+        if not torch.cuda.is_available():
+            return _SW_ROI_LADDER[0], "无 CUDA，roi 取官方值"
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        return _SW_ROI_LADDER[0], "无法读取显存信息，roi 取官方值"
+    budget = _SW_PEAK_BUDGET_FRACTION * total_gb
+    for roi in _SW_ROI_LADDER:
+        if _estimate_sw_peak_gb(roi) <= budget:
+            return roi, (f"显存 {total_gb:.1f}GB，按预算 {budget:.1f}GB 选用 roi {roi}"
+                         f"（该 roi 预估峰值 {_estimate_sw_peak_gb(roi):.1f}GB）")
+    return _SW_ROI_LADDER[-1], f"显存 {total_gb:.1f}GB 偏小，roi 取最小候选 {_SW_ROI_LADDER[-1]}"
+
+
 class NoduleDetector:
     def __init__(self, model_dir, device="cuda", score_thresh=0.3):
         import torch
@@ -438,6 +618,33 @@ class NoduleDetector:
             score_thresh=0.02, topk_candidates_per_level=1000, nms_thresh=0.22, detections_per_img=300
         )
 
+        # 滑窗推理（与官方 bundle 的 inference.json 完全一致）：
+        #   set_sliding_window_inferer(roi_size=[512,512,192], overlap=0.25,
+        #                              sw_batch_size=1, mode="constant", device="cpu")
+        # 触发判据同官方 RetinaNetInferer：体素数 >= roi 体素数时启用滑窗。
+        # 为什么必须要：整卷一次前向时，本卷重采样后 552×552×254≈77.4M 体素，
+        # 中间特征图远超 8GB 显存 -> CUDA OOM -> 自动降级 CPU（单例约 7~14 分钟）。
+        # device="cpu" 指「拼接输出所在设备」，网络本身仍在 GPU 上算，
+        # 只是重叠窗口的累积缓冲放 CPU，从而把显存占用压到单个窗口的量级。
+        self.sw_roi_size = [512, 512, 192]
+        roi_env = os.environ.get("NODULE_SW_ROI", "").strip()
+        if roi_env:
+            self.sw_roi_size = [int(v) for v in roi_env.replace("x", ",").split(",")]
+            self.sw_roi_note = f"roi 由环境变量 NODULE_SW_ROI 指定 = {self.sw_roi_size}"
+        else:
+            auto_roi, self.sw_roi_note = _pick_sliding_window_roi()
+            self.sw_roi_size = [int(v) for v in auto_roi]
+        self.sw_overlap = float(os.environ.get("NODULE_SW_OVERLAP", "0.25"))
+        self.sw_enabled = os.environ.get("NODULE_SLIDING_WINDOW", "1") != "0"
+        self.sw_force = os.environ.get("NODULE_FORCE_SLIDING_WINDOW", "0") == "1"
+        self.detector.set_sliding_window_inferer(
+            roi_size=self.sw_roi_size,
+            overlap=self.sw_overlap,
+            sw_batch_size=1,
+            mode="constant",
+            device=os.environ.get("NODULE_SW_STITCH_DEVICE", "cpu"),
+        )
+
     @staticmethod
     def _preprocess(nii_path):
         from monai.transforms import (
@@ -469,12 +676,25 @@ class NoduleDetector:
         img = self._preprocess(nii_path)  # MetaTensor (C,H,W,D)，携带 affine
         batch_img = img.unsqueeze(0).to(self.device)
 
+        # 与官方 RetinaNetInferer 相同的启用判据：体素数 >= 滑窗 roi 体素数时用滑窗。
+        # 体数据较小(如单肺/低剂量重建)时仍走整卷一次前向，保持原有行为。
+        roi_numel = int(np.prod(self.sw_roi_size))
+        img_numel = int(np.prod(img.shape[1:]))
+        use_inferer = bool(self.sw_enabled and (self.sw_force or img_numel >= roi_numel))
+        if use_inferer:
+            print(f"  [结节检测] 体数据 {tuple(int(x) for x in img.shape[1:])}={img_numel / 1e6:.1f}M "
+                  f"体素 >= 滑窗 roi {tuple(self.sw_roi_size)}={roi_numel / 1e6:.1f}M，启用滑窗推理"
+                  f"（{self.sw_roi_note}）")
+        else:
+            print(f"  [结节检测] 体数据 {tuple(int(x) for x in img.shape[1:])}={img_numel / 1e6:.1f}M "
+                  f"体素 < 滑窗 roi {roi_numel / 1e6:.1f}M，整卷一次前向")
+
         with self.torch.no_grad():
             if self.device.type == "cuda":
                 with self.torch.autocast("cuda", dtype=self.torch.float16):
-                    preds = self.detector([batch_img[0]])
+                    preds = self.detector([batch_img[0]], use_inferer=use_inferer)
             else:
-                preds = self.detector([batch_img[0]])
+                preds = self.detector([batch_img[0]], use_inferer=use_inferer)
 
         pred = preds[0]
         box = pred["box"].to("cpu")
