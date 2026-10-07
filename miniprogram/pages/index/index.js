@@ -103,7 +103,7 @@ Page({
   openCase(e) {
     const id = e.currentTarget.dataset.id
     wx.request({
-      url: BASE + '/api/case/' + id,
+      url: BASE + '/api/case/' + id + '?neutral=1',
       success: (res) => {
         if (res.statusCode === 200 && res.data && res.data.structures) {
           wx.setStorageSync('caseInfo', res.data)
@@ -118,7 +118,7 @@ Page({
   waitCase(caseId, tries) {
     wx.showLoading({ title: '处理中…', mask: true })
     wx.request({
-      url: BASE + '/api/case/' + caseId,
+      url: BASE + '/api/case/' + caseId + '?neutral=1',
       timeout: 20000,
       success: (res) => {
         if (res.statusCode === 200 && res.data && res.data.structures) {

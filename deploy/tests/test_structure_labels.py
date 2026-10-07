@@ -8,6 +8,8 @@
   D 二值体数据                          -> 取文件名作为结构名
   E 数据目录 zip（含 labels.json）      -> 恢复配置中的名称
   F 桌面工具 write_labels_json 输出     -> 可被后端解析
+  G 多标签体数据，标注内嵌 NIfTI 头扩展 -> 无 labels.json 也能恢复名称
+  H neutral=1（小程序送审）             -> 响应中 name/key/mesh 均为中性编号
   附加：空配置 / 坏 json / 名称回退的健壮性
 
 用法（项目根目录下）：
@@ -39,7 +41,7 @@ MED_LABELS = {
     "structures": [
         {"label": 1, "key": "lung_arteries", "name": "肺动脉", "color": [1.0, 0.2, 0.2], "role": "vessel"},
         {"label": 2, "key": "lung_veins", "name": "肺静脉", "color": [0.2, 0.4, 1.0], "role": "vessel"},
-        {"label": 3, "key": "lung_airways", "name": "气管支气管", "color": [0.2, 1.0, 0.3], "role": "airway"},
+        {"label": 3, "key": "lung_airways", "name": "气管", "color": [0.2, 1.0, 0.3], "role": "airway"},
         {"label": 4, "key": "lung_airways_wall", "name": "气道壁", "color": [0.9, 0.6, 0.2], "role": "wall"},
         {"label": 5, "key": "lung_nodules", "name": "肺结节", "color": [1.0, 1.0, 0.1], "role": "lesion"},
     ],
@@ -53,8 +55,12 @@ def check(name, cond, detail=""):
     print(("  PASS  " if cond else "  FAIL  ") + name + (("  |  " + detail) if detail else ""))
 
 
-def make_volume(path, n_labels=5):
-    """生成 n_labels 个分离球形标签的合成体数据（1mm 各向同性）。"""
+def make_volume(path, n_labels=5, labels_payload=None):
+    """生成 n_labels 个分离球形标签的合成体数据（1mm 各向同性）。
+
+    labels_payload 给定时，把该 JSON 作为 NIfTI 头扩展内嵌（模拟桌面工具
+    save_combined_nifti 的自描述输出）。
+    """
     shape = (48, 48, 48)
     affine = np.diag([1.0, 1.0, 1.0, 1.0]).astype(np.float64)
     data = np.zeros(shape, dtype=np.uint8)
@@ -63,7 +69,11 @@ def make_volume(path, n_labels=5):
     for i, (cz, cy, cx) in enumerate(centers[:n_labels], start=1):
         m = ((zz - cz) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2) <= 36
         data[m] = i
-    nib.save(nib.Nifti1Image(data, affine), str(path))
+    img = nib.Nifti1Image(data, affine)
+    if labels_payload is not None:
+        payload = json.dumps(labels_payload, ensure_ascii=False).encode("utf-8")
+        img.header.extensions.append(nib.nifti1.Nifti1Extension(4, payload))
+    nib.save(img, str(path))
     return path
 
 
@@ -106,7 +116,7 @@ print("用例 B —— 多标签体数据 + labels.json  -> 期望恢复原有�
 print("=" * 74)
 info = run_case("B_with_labels", {"combined.nii.gz": _vol, "labels.json": _labels})
 names = [s["name"] for s in info["structures"]]
-check("名称恢复为医学结构名", names == ["肺动脉", "肺静脉", "气管支气管", "气道壁", "肺结节"], str(names))
+check("名称恢复为医学结构名", names == ["肺动脉", "肺静脉", "气管", "气道壁", "肺结节"], str(names))
 art = [s for s in info["structures"] if s["key"] == "lung_arteries"][0]
 check("配色取自配置文件", [round(c, 2) for c in art["color"]] == [1.0, 0.2, 0.2], str(art["color"]))
 
@@ -152,7 +162,7 @@ def _make_zip(dest):
 
 info = run_case("E_zip", {"data.zip": _make_zip})
 check("zip 内 labels.json 生效",
-      [s["name"] for s in info["structures"]] == ["肺动脉", "肺静脉", "气管支气管", "气道壁", "肺结节"])
+      [s["name"] for s in info["structures"]] == ["肺动脉", "肺静脉", "气管", "气道壁", "肺结节"])
 
 print()
 print("=" * 74)
@@ -169,11 +179,60 @@ try:
     check("write_labels_json 可被后端解析", parsed is not None and len(parsed["by_label"]) == 5)
     ok_names = [parsed["by_label"][i]["name"] for i in range(1, 6)]
     check("名称与角色正确",
-          ok_names == ["肺动脉", "肺静脉", "气管支气管", "气道壁", "肺结节"]
+          ok_names == ["肺动脉", "肺静脉", "气管", "气道壁", "肺结节"]
           and parsed["by_label"][1]["role"] == "vessel"
           and parsed["by_label"][4]["role"] == "wall", str(ok_names))
+    # save_combined_nifti：标注写入 NIfTI 头扩展，后端可直接从 .nii.gz 读回
+    lab_map = {1: "lung_arteries", 2: "lung_veins", 3: "lung_airways",
+               4: "lung_airways_wall", 5: "lung_nodules"}
+    p2 = out / "combined.nii.gz"
+    rc.save_combined_nifti(np.zeros((8, 8, 8), np.uint8), np.eye(4), p2, lab_map)
+    parsed2 = api.parse_label_config_from_nifti(p2)
+    check("save_combined_nifti 头扩展可被后端解析",
+          parsed2 is not None and len(parsed2["by_label"]) == 5, str(parsed2))
+    check("头扩展名称正确",
+          parsed2 is not None
+          and [parsed2["by_label"][i]["name"] for i in range(1, 6)]
+          == ["肺动脉", "肺静脉", "气管", "气道壁", "肺结节"])
 except Exception as e:
     check("write_labels_json 可被后端解析", False, "%s: %s" % (type(e).__name__, e))
+
+print()
+print("=" * 74)
+print("用例 G —— 无 labels.json，标注内嵌 combined.nii.gz 头扩展")
+print("=" * 74)
+info = run_case("G_header_ext", {"combined.nii.gz":
+                                 lambda p: make_volume(p, 5, MED_LABELS)})
+names = [s["name"] for s in info["structures"]]
+keys = [s["key"] for s in info["structures"]]
+check("头扩展标注恢复名称", names == ["肺动脉", "肺静脉", "气管", "气道壁", "肺结节"], str(names))
+check("头扩展恢复键名", keys == ["lung_arteries", "lung_veins", "lung_airways",
+                                "lung_airways_wall", "lung_nodules"], str(keys))
+check("头扩展恢复配色",
+      [round(c, 2) for c in [s for s in info["structures"] if s["key"] == "lung_arteries"][0]["color"]]
+      == [1.0, 0.2, 0.2])
+
+print()
+print("=" * 74)
+print("用例 H —— neutral=1（微信小程序）：响应不含人体结构字段")
+print("=" * 74)
+info_n = api.get_case("G_header_ext", neutral=True)
+names_n = [s["name"] for s in info_n.get("structures", [])]
+keys_n = [s["key"] for s in info_n.get("structures", [])]
+meshes_n = [s["mesh"] for s in info_n.get("structures", [])]
+check("neutral 显示名为 结构 N", names_n == ["结构 %d" % i for i in range(1, 6)], str(names_n))
+check("neutral 键名为 sN", keys_n == ["s%d" % i for i in range(1, 6)], str(keys_n))
+check("neutral mesh 为 nN.glb",
+      meshes_n == ["/api/mesh/G_header_ext/n%d.glb" % i for i in range(1, 6)], str(meshes_n))
+_raw = json.dumps(info_n, ensure_ascii=False)
+check("响应中无 lung_/肺 等结构字段", "lung_" not in _raw and "肺" not in _raw, _raw[:300])
+_r1 = api.get_mesh("G_header_ext", "n1.glb")
+check("n1.glb 别名可取到网格",
+      not isinstance(_r1, api.JSONResponse) and getattr(_r1, "status_code", 200) == 200,
+      str(type(_r1)))
+info_o = api.get_case("G_header_ext")
+check("缺省(neutral=0)仍返回真实名称",
+      [s["name"] for s in info_o.get("structures", [])] == ["肺动脉", "肺静脉", "气管", "气道壁", "肺结节"])
 
 print()
 print("=" * 74)

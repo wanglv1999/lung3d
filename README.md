@@ -2,7 +2,7 @@
 
 针对肺薄层 CT 的**三维重建**与**3D 查看**工具集，包含两套软件：
 
-1. **分割重建软件**（`lung3d_reconstruct.py`）：TotalSegmentator(`lung_vessels`) 自动分割肺动脉/肺静脉/气管支气管/气道壁，MONAI RetinaNet(LUNA16) 检测肺结节，合并为统一标签体数据 `combined.nii.gz`，并导出每个结构的 STL/OBJ 三维模型与体积报告。
+1. **分割重建软件**（`lung3d_reconstruct.py`）：TotalSegmentator(`lung_vessels`) 自动分割肺动脉/肺静脉/气管（气道壁不再输出），MONAI RetinaNet(LUNA16) 检测肺结节，合并为统一标签体数据 `combined.nii.gz`，并导出每个结构的 STL/OBJ 三维模型与体积报告。
 2. **3D 查看器**（`viewer3d.py`）：VTK + PySide6 桌面查看器，支持缩放/旋转/平移、复选框切换显示指定模型、CT 体渲染、窗宽窗位预设、模型透明度与网格精度调节、截图与自动旋转。
 
 此外还附带：
@@ -101,7 +101,8 @@ run_lung3d.bat --input D:\全部数据 --output .\output --device cuda --nodule-
 ```
 case_001_case01/
 ├── ct.nii.gz                 # 转换后的 CT
-├── combined.nii.gz           # 统一标签体数据：1肺动 2肺静 3气管 4气道壁 5结节
+├── combined.nii.gz           # 统一标签体数据：1肺动 2肺静 3气管 5结节（4气道壁已停用）；
+│                             #   结构标注(JSON)同时内嵌于 NIfTI 头扩展，文件自描述
 ├── report.json               # 各结构体积(cm³) + 结节列表
 ├── labels.json               # 结构标注（显示名/配色/角色），供查看端读取
 ├── seg_totalseg/             # TotalSegmentator 输出（*.nii.gz）
@@ -109,7 +110,8 @@ case_001_case01/
 ```
 
 > 结构名称不再写死在查看端。查看端（网页 / 小程序 / 移动端）一律从数据目录内的
-> `labels.json` 读取显示名与配色；缺少该文件时按标签序号显示为「结构 1、结构 2 …」。
+> `labels.json` 读取显示名与配色；缺少该文件时回退读取 `combined.nii.gz` 的
+> NIfTI 头扩展（同一份标注，随文件走）；都没有时按标签序号显示为「结构 1、结构 2 …」。
 > 这样查看端保持为与领域无关的通用三维模型查看器。
 
 ### 2. 桌面 3D 查看器（软件二）
@@ -123,7 +125,7 @@ run_viewer.bat D:\xxx\combined.nii.gz     # 或单个分割文件
 操作说明：
 
 - 左键旋转 / 中键平移 / 右键或滚轮缩放
-- 复选框切换显示：肺动脉 / 肺静脉 / 气管支气管 / 气道壁 / 肺结节 / CT 体渲染
+- 复选框切换显示：肺动脉 / 肺静脉 / 气管 / 肺结节 / CT 体渲染
 - 点击 3D 对象 = 选中；快捷键 `H` 隐藏选中、`U` 全部显示
 - `r` 复位视角 / `s` 截图 / `a` 自动旋转
 - 右侧面板可调重建精度、透明度、CT 窗宽窗位预设

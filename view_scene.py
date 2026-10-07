@@ -14,9 +14,8 @@ try:
         slicer.util.loadVolume(str(ct))
         L("CT loaded")
 
-    colors = {"lung_arteries": (1.0, 0.2, 0.2), "lung_veins": (0.2, 0.4, 1.0),
-              "lung_airways": (0.2, 1.0, 0.3), "lung_airways_wall": (0.9, 0.6, 0.2),
-              "lung_nodules": (1.0, 1.0, 0.1)}
+    colors = {"lung_arteries": (0.2, 0.4, 1.0), "lung_veins": (0.55, 0.1, 0.1),
+              "lung_airways": (0.2, 1.0, 0.3), "lung_nodules": (1.0, 1.0, 0.1)}
     mesh_dir = case_dir / "mesh"
     if mesh_dir.is_dir():
         for p in sorted(mesh_dir.glob("*.stl")):

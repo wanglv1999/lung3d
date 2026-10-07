@@ -5,7 +5,7 @@ Lung3D 分割模型 3D 查看器（VTK + PySide6/Qt）
 =============================================
 功能：
   - 加载病例目录（ct.nii.gz / combined.nii.gz / seg_totalseg/*.nii.gz）或单个 nii.gz
-  - 复选框切换显示 肺动脉 / 肺静脉 / 气管支气管 / 气道壁 / 肺结节 / CT 体渲染
+  - 复选框切换显示 肺动脉 / 肺静脉 / 气管 / 肺结节 / CT 体渲染
   - 鼠标操作：左键旋转 / 中键平移 / 右键缩放 / 滚轮缩放
   - 快捷键：r 复位视角   s 截图   a 自动旋转开关
   - 模型透明度滑块、网格重建精度、CT 窗宽窗位预设
@@ -38,17 +38,15 @@ from PySide6.QtWidgets import (
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
 STRUCTURES = [
-    dict(key="lung_arteries", name="肺动脉", color=(1.00, 0.20, 0.20), opacity=0.95),
-    dict(key="lung_veins", name="肺静脉", color=(0.20, 0.40, 1.00), opacity=0.95),
-    dict(key="lung_airways", name="气管支气管", color=(0.20, 1.00, 0.30), opacity=0.95),
-    dict(key="lung_airways_wall", name="气道壁", color=(0.90, 0.60, 0.20), opacity=0.95),
+    dict(key="lung_arteries", name="肺动脉", color=(0.20, 0.40, 1.00), opacity=0.95),
+    dict(key="lung_veins", name="肺静脉", color=(0.55, 0.10, 0.10), opacity=0.95),
+    dict(key="lung_airways", name="气管", color=(0.20, 1.00, 0.30), opacity=0.95),
     dict(key="lung_nodules", name="肺结节", color=(1.00, 1.00, 0.10), opacity=1.00),
 ]
 LABEL_MAP = {
     1: "lung_arteries",
     2: "lung_veins",
     3: "lung_airways",
-    4: "lung_airways_wall",
     5: "lung_nodules",
 }
 PALETTE = [

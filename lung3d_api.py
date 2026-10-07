@@ -14,7 +14,9 @@ Lung3D Web 后端服务（FastAPI）
                          - 单个二值 nii.gz(文件名作为结构名)
                          - 病例目录 zip(ct.nii.gz/combined.nii.gz/seg_totalseg/*/report.json/labels.json)
                          - 多个 nii.gz 同时上传(各自为独立结构)
-  GET  /api/case/{id}   读取某病例 report.json
+  GET  /api/case/{id}?neutral=1  读取某病例 report.json。neutral=1 时结构的
+                         name/key/mesh 替换为中性「结构 N / sN / nN.glb」
+                         （微信小程序用，送审安全；缺省返回真实名称，网页端用）
   GET  /api/mesh/{case_id}/{name}.glb   下载网格
   GET  /api/cases       已处理病例列表
   GET  /api/wxacode     生成打开某病例3D页的微信小程序码(PNG)。需配置 wx_config.json(appid/secret)
@@ -29,8 +31,9 @@ Lung3D Web 后端服务（FastAPI）
 
 结构命名（外部化）：
   本服务不内置任何领域结构名称。显示名 / 配色 / 处理角色来自数据目录内的
-  labels.json（或 structures.json），也可用环境变量 STRUCTURE_LABELS 指定外部文件。
-  二者都缺失时，按标签序号生成中性名称「结构 N」并自动分配配色。
+  labels.json（或 structures.json），也可用环境变量 STRUCTURE_LABELS 指定外部文件；
+  都缺失时再回退读取 combined.nii.gz 的 NIfTI 头扩展（桌面工具写入的自描述标注）。
+  全部缺失时，按标签序号生成中性名称「结构 N」并自动分配配色。
 """
 import argparse
 import base64
@@ -69,7 +72,8 @@ _PROCESS_SEM = threading.BoundedSemaphore(MAX_CONCURRENT_PROCESSING)
 # 结构的显示名、配色、处理角色全部来自「数据侧」提供的标注配置：
 #   1) 上传的数据目录内的 labels.json / structures.json（推荐，随数据走）
 #   2) 环境变量 STRUCTURE_LABELS 指向的外部配置文件（运维侧可选）
-# 两者都没有时，按标签序号生成中性名称（结构 1、结构 2 …）并自动分配配色。
+#   3) combined.nii.gz 的 NIfTI 头扩展（桌面工具随文件内嵌的同款 JSON）
+# 都没有时，按标签序号生成中性名称（结构 1、结构 2 …）并自动分配配色。
 LABELS_FILENAMES = ("labels.json", "structures.json")
 LABELS_ENV = "STRUCTURE_LABELS"
 
@@ -96,7 +100,7 @@ def empty_label_config():
 
 
 def parse_label_config(path):
-    """解析结构标注配置。成功返回 {"by_label": {int: st}, "by_key": {str: st}}，失败返回 None。
+    """解析结构标注配置文件。成功返回 {"by_label": ..., "by_key": ...}，失败返回 None。
 
     格式（structures 列表的先后顺序即缺省 label 顺序）：
       {
@@ -112,6 +116,11 @@ def parse_label_config(path):
     except Exception:
         return None
     items = raw.get("structures") if isinstance(raw, dict) else raw
+    return _label_config_from_items(items)
+
+
+def _label_config_from_items(items):
+    """structures 列表 -> {"by_label": {int: st}, "by_key": {str: st}}；输入不合法返回 None。"""
     if not isinstance(items, list):
         return None
     by_label, by_key = {}, {}
@@ -142,8 +151,46 @@ def parse_label_config(path):
     return {"by_label": by_label, "by_key": by_key}
 
 
+def parse_label_config_from_nifti(path):
+    """从 NIfTI 头扩展读取结构标注 JSON（combined.nii.gz 自描述，桌面工具写入）。
+
+    扩展码 4(Comment) 内容为 labels.json 同款 JSON；读不到/解析失败返回 None。
+    """
+    try:
+        import nibabel as nib
+        img = nib.load(str(path))
+        for ext in img.header.extensions:
+            try:
+                content = ext.get_content()
+            except Exception:
+                continue
+            if isinstance(content, bytes):
+                try:
+                    content = content.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+            if not isinstance(content, str) or not content.strip():
+                continue
+            try:
+                raw = json.loads(content)
+            except Exception:
+                continue
+            items = raw.get("structures") if isinstance(raw, dict) else raw
+            cfg = _label_config_from_items(items)
+            if cfg is not None and cfg["by_label"]:
+                return cfg
+    except Exception:
+        return None
+    return None
+
+
 def load_label_config(*roots):
     """按顺序在给定目录中查找标注配置，再回退到 STRUCTURE_LABELS 环境变量。
+
+    查找顺序：
+      1) 各目录内的 labels.json / structures.json
+      2) 环境变量 STRUCTURE_LABELS 指向的文件
+      3) 各目录内 *.nii(.gz) 的 NIfTI 头扩展（combined.nii.gz 自描述标注）
 
     返回 {"by_label": ..., "by_key": ...}；一处都找不到时返回空配置
     （调用方据此生成中性结构名）。
@@ -160,6 +207,18 @@ def load_label_config(*roots):
             cfg = parse_label_config(p)
             if cfg is not None:
                 print("[Lung3D] structure labels loaded from", p)
+                return cfg
+    # 回退：NIfTI 头扩展（上传/zip 数据里可能没有 labels.json，但 combined 自带标注）
+    for r in roots:
+        if not r:
+            continue
+        r = Path(r)
+        if not r.is_dir():
+            continue
+        for p in sorted(r.glob("*.nii*")):
+            cfg = parse_label_config_from_nifti(p)
+            if cfg is not None:
+                print("[Lung3D] structure labels loaded from NIfTI header of", p)
                 return cfg
     return empty_label_config()
 
@@ -567,8 +626,34 @@ async def process_files(files: list[UploadFile] = File(...), name: str = Form(No
     return {"status": "processing", "case_id": case_id}
 
 
+def neutralize_case_info(info):
+    """小程序送审安全：响应中不出现任何人体结构相关字段值。
+
+    - structures[].name  -> 中性「结构 N」
+    - structures[].key   -> 中性 sN（原 key 如 lung_arteries 不下发）
+    - structures[].mesh  -> /api/mesh/{case}/nN.glb（网格路由按序号别名解析回真实文件）
+    只在响应层替换，不改磁盘上的 report.json，网页端仍可取到真实名称。
+    """
+    if isinstance(info, dict) and isinstance(info.get("structures"), list):
+        case_id = str(info.get("case_id") or "")
+        structs = []
+        for i, st in enumerate(info["structures"], start=1):
+            ns = dict(st)
+            ns["name"] = "结构 %d" % i
+            ns["key"] = "s%d" % i
+            if isinstance(st.get("mesh"), str):
+                ns["mesh"] = "/api/mesh/%s/n%d.glb" % (case_id, i)
+            structs.append(ns)
+        info = dict(info)
+        info["structures"] = structs
+    return info
+
+
 @app.get("/api/case/{case_id}")
-def get_case(case_id: str):
+def get_case(case_id: str, neutral: bool = False):
+    """neutral=1（小程序请求用）：structures 的 name/key/mesh 一律替换为中性
+    「结构 N / sN / nN.glb」，响应中不出现任何人体结构名称；缺省 false 返回
+    真实名称（网页端用）。磁盘上的 report.json 不受影响。"""
     d = OUTPUT_DIR / case_id
     rp = d / "report.json"
     if not rp.exists():
@@ -576,7 +661,10 @@ def get_case(case_id: str):
         if ep.exists():
             return JSONResponse({"error": ep.read_text(encoding="utf-8")}, status_code=400)
         return JSONResponse({"error": "数据不存在或处理中"}, status_code=404)
-    return json.loads(rp.read_text(encoding="utf-8"))
+    info = json.loads(rp.read_text(encoding="utf-8"))
+    if neutral:
+        info = neutralize_case_info(info)
+    return info
 
 @app.delete("/api/case/{case_id}")
 def delete_case(case_id: str):
@@ -605,7 +693,20 @@ def rename_case(case_id: str, payload: dict):
 def get_mesh(case_id: str, name: str):
     p = OUTPUT_DIR / case_id / "meshes" / name
     if not p.exists() or p.suffix.lower() not in (".glb",):
-        return JSONResponse({"error": "网格不存在"}, status_code=404)
+        # 中性别名：nN.glb -> report.json 中第 N 个结构的真实网格文件（s 送审响应用）
+        m = re.fullmatch(r"n(\d+)\.glb", name)
+        if m and p.parent.is_dir():
+            try:
+                info = json.loads(
+                    (OUTPUT_DIR / case_id / "report.json").read_text(encoding="utf-8"))
+                idx = int(m.group(1)) - 1
+                structs = info.get("structures") or []
+                real = str(structs[idx].get("key")) + ".glb"
+                p = p.parent / real
+            except Exception:
+                p = OUTPUT_DIR / case_id / "meshes" / "__missing__"
+        if not p.exists() or p.suffix.lower() not in (".glb",):
+            return JSONResponse({"error": "网格不存在"}, status_code=404)
     return FileResponse(p, media_type="model/gltf-binary")
 
 

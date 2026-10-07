@@ -29,7 +29,7 @@ Page({
       // 扫码直达：按 scene 中的 case_id 从服务器拉取数据
       wx.showLoading({ title: '加载数据…', mask: true })
       wx.request({
-        url: BASE + '/api/case/' + cid,
+        url: BASE + '/api/case/' + cid + '?neutral=1',
         success: (res) => {
           wx.hideLoading()
           if (res.statusCode === 200 && res.data && res.data.structures) {
@@ -65,10 +65,13 @@ Page({
     if (this.info.ct_mesh) {
       structures.push({ key: '__ct__', name: '体数据轮廓', color: 'rgb(136,146,160)', checked: true })
     }
-    for (const s of this.info.structures) {
+    for (let i = 0; i < this.info.structures.length; i++) {
+      const s = this.info.structures[i]
       structures.push({
         key: s.key,
-        name: s.name,
+        // 小程序端不展示人体结构名称（送审要求）：一律用中性编号，
+        // 不信任服务端返回/本地缓存中的 name 字段。
+        name: '结构 ' + (i + 1),
         color: 'rgb(' + s.color.map((c) => Math.round(c * 255)).join(',') + ')',
         checked: true,
       })
