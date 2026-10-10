@@ -29,7 +29,7 @@ Page({
       // 扫码直达：按 scene 中的 case_id 从服务器拉取数据
       wx.showLoading({ title: '加载数据…', mask: true })
       wx.request({
-        url: BASE + '/api/case/' + cid + '?neutral=1',
+        url: BASE + '/api/case/' + cid,
         success: (res) => {
           wx.hideLoading()
           if (res.statusCode === 200 && res.data && res.data.structures) {
@@ -69,9 +69,10 @@ Page({
       const s = this.info.structures[i]
       structures.push({
         key: s.key,
-        // 小程序端不展示人体结构名称（送审要求）：一律用中性编号，
-        // 不信任服务端返回/本地缓存中的 name 字段。
-        name: '结构 ' + (i + 1),
+        // 名称一律采用服务端返回值（来源为用户上传数据自身的标注/文件头）。
+        // 小程序自身不内置任何领域名称，只做通用三维模型展示；
+        // 缺失时才回退到中性占位「结构 N」。
+        name: s.name || ('结构 ' + (i + 1)),
         color: 'rgb(' + s.color.map((c) => Math.round(c * 255)).join(',') + ')',
         checked: true,
       })

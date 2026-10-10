@@ -1,6 +1,6 @@
 <view class="page">
   <view class="hero">
-    <text class="title">Lung3D</text>
+    <text class="title">View3D</text>
   </view>
 
   <view class="upload" bindtap="chooseFile">

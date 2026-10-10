@@ -55,8 +55,9 @@ Page({
 
   upload(f) {
     wx.showModal({
-      title: '数据名称',
-      content: '给该数据起个名字（可选）：',
+      // 注意：editable 模式下 content 会作为输入框的“预填内容”（与用户输入共享），
+      // 因此提示语必须放在 title / placeholderText，content 必须留空。
+      title: '数据名称（可选）',
       editable: true,
       placeholderText: '如：张三 2026-09-01',
       success: (res) => {
@@ -103,7 +104,7 @@ Page({
   openCase(e) {
     const id = e.currentTarget.dataset.id
     wx.request({
-      url: BASE + '/api/case/' + id + '?neutral=1',
+      url: BASE + '/api/case/' + id,
       success: (res) => {
         if (res.statusCode === 200 && res.data && res.data.structures) {
           wx.setStorageSync('caseInfo', res.data)
@@ -118,7 +119,7 @@ Page({
   waitCase(caseId, tries) {
     wx.showLoading({ title: '处理中…', mask: true })
     wx.request({
-      url: BASE + '/api/case/' + caseId + '?neutral=1',
+      url: BASE + '/api/case/' + caseId,
       timeout: 20000,
       success: (res) => {
         if (res.statusCode === 200 && res.data && res.data.structures) {
