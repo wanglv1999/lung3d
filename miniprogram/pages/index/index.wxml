@@ -30,6 +30,5 @@
   <view class="foot">
     <view>文件在服务器端生成 3D 网格后返回手机显示</view>
     <view class="beian" wx:if="{{icpBeian}}" bindtap="copyBeian">{{icpBeian}}</view>
-    <view class="beian" wx:if="{{policeBeian}}" bindtap="copyPoliceBeian">{{policeBeian}}</view>
   </view>
 </view>
