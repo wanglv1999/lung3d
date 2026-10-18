@@ -902,9 +902,34 @@ def _case_exists(case_id):
     return (OUTPUT_DIR / case_id / "report.json").exists()
 
 
+def _wx_post_png(url, body):
+    """POST JSON 到微信接口，成功返回 (png_bytes, None)，失败返回 (None, err_dict)。"""
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+    except urllib.error.HTTPError as e:
+        return None, {"errcode": -1, "errmsg": e.read().decode("utf-8", "ignore")}
+    if data[:1] == b"{":  # 微信出错时返回 JSON
+        try:
+            return None, json.loads(data.decode("utf-8"))
+        except Exception:
+            return None, {"errcode": -1, "errmsg": "无法解析微信返回"}
+    return data, None
+
+
 @app.get("/api/wxacode")
 def wxacode(case: str, env: str = None, env_version: str = None):
-    """生成打开该病例 3D 页的微信小程序码(PNG)。scene = c=<case_id>。"""
+    """生成打开该病例 3D 页的微信小程序码(PNG)。
+
+    优先 `getwxacodeunlimited`（scene=c=<id>，不限量）；当它返回 40066 时自动
+    降级到 `getwxacode`（path=pages/viewer/viewer?c=<id>，总量 10 万张）。
+    40066 与页面路径无关 —— 实测连首页路径、连不带 page 也报，
+    真实原因是**小程序没有正式发布版本**，此时不限量接口整类不可用。
+    前端 `viewer.js` 的 resolveCaseId 同时认 `options.c` 与 scene，两种码都能直达。
+    响应头 `X-Wxacode-Mode` 标明实际用的是哪种（unlimited / limited）。
+    """
     if not _case_exists(case):
         return JSONResponse({"error": "数据不存在"}, status_code=404)
     cfg = _load_wx_config()
@@ -916,28 +941,37 @@ def wxacode(case: str, env: str = None, env_version: str = None):
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    body = json.dumps({
+    tok_q = urllib.parse.quote(token)
+    unlimited_body = {
         "scene": "c=" + case,
         "page": "pages/viewer/viewer",
         "check_path": False,
         "env_version": ver,
         "width": 430,
         "auto_color": False,
-    }).encode("utf-8")
-    url = "https://api.weixin.qq.com/wxa/getwxacodeunlimited?access_token=" + urllib.parse.quote(token)
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = r.read()
-    except urllib.error.HTTPError as e:
-        return JSONResponse({"error": "生成小程序码失败: %s" % e.read().decode("utf-8")}, status_code=502)
-    if data[:1] == b"{":  # 微信错误返回 json
-        try:
-            err = json.loads(data.decode("utf-8"))
-            return JSONResponse({"error": "生成小程序码失败: %s" % err}, status_code=502)
-        except Exception:
-            pass
-    return Response(content=data, media_type="image/png")
+    }
+    data, err = _wx_post_png(
+        "https://api.weixin.qq.com/wxa/getwxacodeunlimited?access_token=" + tok_q, unlimited_body)
+    mode = "unlimited"
+    if err is not None:
+        limited_body = {"path": "pages/viewer/viewer?c=" + case, "width": 430, "auto_color": False}
+        data, err2 = _wx_post_png(
+            "https://api.weixin.qq.com/wxa/getwxacode?access_token=" + tok_q, limited_body)
+        mode = "limited"
+        if err2 is not None:
+            return JSONResponse({
+                "error": "生成小程序码失败: %s" % err2,
+                "unlimited_error": err,
+                "hint": "两种接口都失败：请确认小程序已发布正式版本，且 viewer 页面在线上版本中存在",
+            }, status_code=502)
+    # 微信两种接口返回的图片格式不固定（实测 limited 给 JPEG），按魔数标 Content-Type
+    if data[:4] == b"\x89PNG":
+        media = "image/png"
+    elif data[:2] == b"\xff\xd8":
+        media = "image/jpeg"
+    else:
+        media = "image/png"
+    return Response(content=data, media_type=media, headers={"X-Wxacode-Mode": mode})
 
 
 @app.get("/api/qrcode")
