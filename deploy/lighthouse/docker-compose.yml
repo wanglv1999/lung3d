@@ -20,8 +20,12 @@ services:
       MAX_CONCURRENT_PROCESSING: "1"
       # 远端细血管剪除阈值(mm)：越大网格越小
       DISTAL_PRUNE_MM: "1.0"
-      # 本地盘无临时盘顾虑，放宽自动清理周期(天)
+      # 本地盘无临时盘顾虑，放宽自动清理周期(天)；设 0 则完全不删
       CASE_EXPIRE_DAYS: "30"
+      # 病例产物根目录（与下方 volume 的容器侧路径一致）
+      CASE_ROOT: "/data/cases"
+      # 上传暂存放容器临时盘，处理完自动删除
+      UPLOAD_STAGING_DIR: "/tmp/lung3d_uploads"
       # ---- 微信小程序码（从 .env 注入，勿写死）----
       WX_APPID: "${WX_APPID}"
       WX_SECRET: "${WX_SECRET}"
@@ -29,7 +33,7 @@ services:
 
     volumes:
       # 病例数据落宿主机本地盘 → 容器重建/升级都不丢
-      - /data/lung3d/cases:/app/web_output/cases
+      - /data/lung3d/cases:/data/cases
 
     # 内存硬上限，避免单个病例把宿主机拖死（swap 由 setup_server.sh 配置）
     mem_limit: 1536m

@@ -34,6 +34,14 @@ Lung3D Web 后端服务（FastAPI）
   labels.json（或 structures.json），也可用环境变量 STRUCTURE_LABELS 指定外部文件；
   都缺失时再回退读取 combined.nii.gz 的 NIfTI 头扩展（桌面工具写入的自描述标注）。
   全部缺失时，按标签序号生成中性名称「结构 N」并自动分配配色。
+
+存储位置（持久化）：
+  CASE_ROOT            病例产物根目录。默认 <项目>/web_output/cases（容器内=临时盘）。
+                       生产指向挂载盘：轻量服务器 bind mount 或云托管 CFS，如 /data/cases。
+  UPLOAD_STAGING_DIR   上传暂存目录。默认系统临时盘；处理完自动删除，不占持久盘。
+  CASE_EXPIRE_DAYS     自动清理保留天数，默认 7；设为 0 关闭自动删除（持久盘场景）。
+  命令行 --case-root   等价于设置 CASE_ROOT（优先级更高）。
+  GET /api/health      返回 storage 段（backend/path/writable/free_gb/expire_days）。
 """
 import argparse
 import base64
@@ -43,6 +51,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import urllib.error
@@ -58,7 +67,108 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT_DIR = ROOT / "web_output" / "cases"
+
+# ---------------------------------------------------------------------------
+# 存储位置（持久化改造）
+# ---------------------------------------------------------------------------
+# 病例产物默认落在 web_output/cases（容器内即临时盘，重启/缩容会丢）。
+# 生产环境用环境变量 CASE_ROOT 指到持久化位置：
+#   轻量服务器 / 云主机：bind mount 宿主机目录，CASE_ROOT=/data/cases
+#   微信云托管：挂载 CFS 文件存储，CASE_ROOT=/data/cases
+# 上传的原始文件另有暂存目录 UPLOAD_STAGING_DIR（默认系统临时盘），
+# 处理完即删除 —— 大文件不必写进持久盘，病例目录也不再残留 upload/。
+CASE_ROOT_ENV = "CASE_ROOT"
+UPLOAD_STAGING_ENV = "UPLOAD_STAGING_DIR"
+DEFAULT_CASE_ROOT = ROOT / "web_output" / "cases"
+STORAGE_CACHE_TTL = 30.0  # 健康检查里存储探测的缓存秒数（NFS 抖动时别拖慢探针）
+
+
+def _resolve_dir(env_name, default):
+    """环境变量里的目录 -> 绝对 Path；相对路径按项目根解析；空值用默认。"""
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return Path(default)
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    return p
+
+
+def storage_backend():
+    """external = 已指向持久化位置（挂载盘/CFS）；local = 容器内临时盘。"""
+    return "external" if (os.environ.get(CASE_ROOT_ENV) or "").strip() else "local"
+
+
+def case_expire_days():
+    """自动清理保留天数；<=0 表示不自动删除（持久盘场景可关掉）。"""
+    try:
+        return int(os.environ.get("CASE_EXPIRE_DAYS", "7"))
+    except Exception:
+        return 7
+
+
+OUTPUT_DIR = _resolve_dir(CASE_ROOT_ENV, DEFAULT_CASE_ROOT)
+UPLOAD_STAGING = _resolve_dir(UPLOAD_STAGING_ENV,
+                              Path(tempfile.gettempdir()) / "lung3d_uploads")
+
+_storage_cache = {"at": 0.0, "info": None}
+
+
+def write_json_atomic(path, obj):
+    """先写同目录临时文件再 os.replace —— 跨实例/挂载盘上不会读到半截 JSON。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name("%s.tmp.%d.%d" % (path.name, os.getpid(), threading.get_ident()))
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def storage_info(refresh=False):
+    """存储状态（供 /api/health 与启动自检使用），带 TTL 缓存。
+
+    探测失败不抛异常 —— 健康检查必须始终能返回，挂载盘掉线时由
+    writable=False / free_gb=null 体现。
+    """
+    now = time.time()
+    if not refresh and _storage_cache["info"] and now - _storage_cache["at"] < STORAGE_CACHE_TTL:
+        return _storage_cache["info"]
+
+    info = {
+        "backend": storage_backend(),
+        "path": str(OUTPUT_DIR),
+        "staging": str(UPLOAD_STAGING),
+        "writable": False,
+        "free_gb": None,
+        "total_gb": None,
+        "expire_days": case_expire_days(),
+    }
+    try:
+        info["writable"] = OUTPUT_DIR.is_dir() and os.access(str(OUTPUT_DIR), os.W_OK)
+    except Exception:
+        info["writable"] = False
+    try:
+        probe = OUTPUT_DIR if OUTPUT_DIR.exists() else OUTPUT_DIR.parent
+        usage = shutil.disk_usage(str(probe))
+        info["free_gb"] = round(usage.free / (1024.0 ** 3), 2)
+        info["total_gb"] = round(usage.total / (1024.0 ** 3), 2)
+    except Exception:
+        pass
+    _storage_cache["info"] = info
+    _storage_cache["at"] = now
+    return info
+
+
+def ensure_storage():
+    """启动自检：建目录 + 真实写一个探针文件，返回 (ok, message)。"""
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        UPLOAD_STAGING.mkdir(parents=True, exist_ok=True)
+        probe = OUTPUT_DIR / ".write_probe"
+        probe.write_text(str(time.time()), encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
 # 并发处理上限：同时只处理 MAX_CONCURRENT_PROCESSING 个病例，
 # 其余排队等待，避免多任务同时占用内存导致容器 OOM。
@@ -530,19 +640,26 @@ def build_case(case_dir, masks, ct_data, ct_affine, report, label_cfg=None):
         case_info["spacing_mm"] = [round(float(x), 4) for x in spacing]
         case_info["dimensions"] = list(masks[list(masks.keys())[0]][0].shape) if masks else None
 
-    (case_dir / "report.json").write_text(
-        json.dumps(case_info, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(case_dir / "report.json", case_info)
     return case_info
 
 
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
-def _process_upload_worker(case_dir, case_name):
-    """后台异步处理上传的病例（受并发信号量限制，避免同时占用内存）。"""
+def _process_upload_worker(case_dir, case_name, upload_dir=None):
+    """后台异步处理上传的病例（受并发信号量限制，避免同时占用内存）。
+
+    upload_dir 为上传暂存目录（本地临时盘）；缺省回退到 case_dir/upload，
+    兼容旧调用与历史数据。处理结束（成功或失败）都会清掉暂存目录。
+    """
+    staging = Path(upload_dir) if upload_dir else (case_dir / "upload")
     with _PROCESS_SEM:
         try:
-            tmp = case_dir / "upload"
+            tmp = staging
+            if not tmp.is_dir():
+                (case_dir / "error.txt").write_text("上传暂存目录不存在", encoding="utf-8")
+                return
             masks, ct_data, ct_affine, report = {}, None, None, {}
             label_cfg = load_label_config(tmp, case_dir)
             for p in sorted(tmp.iterdir()):
@@ -577,8 +694,7 @@ def _process_upload_worker(case_dir, case_name):
                 return
             if case_name and case_name.strip():
                 case_info["name"] = case_name.strip()
-                (case_dir / "report.json").write_text(
-                    json.dumps(case_info, ensure_ascii=False, indent=2), encoding="utf-8")
+                write_json_atomic(case_dir / "report.json", case_info)
             print("case processed:", case_dir.name)
         except Exception as e:
             try:
@@ -587,6 +703,9 @@ def _process_upload_worker(case_dir, case_name):
                 pass
             print("case processing error:", case_dir.name, e)
         finally:
+            # 暂存目录用完即删：持久盘上不再堆积整份上传原件
+            if upload_dir:
+                shutil.rmtree(staging, ignore_errors=True)
             gc.collect()
 
 
@@ -598,8 +717,9 @@ async def process_files(files: list[UploadFile] = File(...), name: str = Form(No
     case_id = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
     case_dir = OUTPUT_DIR / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
-    tmp = case_dir / "upload"
-    tmp.mkdir(exist_ok=True)
+    # 原始上传先落本地临时盘（快、不占持久盘），处理完由 worker 删除
+    tmp = UPLOAD_STAGING / case_id
+    tmp.mkdir(parents=True, exist_ok=True)
 
     use_filename = (filename or "").strip()
     for uf in files:
@@ -622,7 +742,8 @@ async def process_files(files: list[UploadFile] = File(...), name: str = Form(No
             except Exception:
                 pass
 
-    threading.Thread(target=_process_upload_worker, args=(case_dir, name), daemon=True).start()
+    threading.Thread(target=_process_upload_worker, args=(case_dir, name, tmp),
+                     daemon=True).start()
     return {"status": "processing", "case_id": case_id}
 
 
@@ -685,7 +806,7 @@ def rename_case(case_id: str, payload: dict):
         return JSONResponse({"error": "名称不能为空"}, status_code=400)
     info = json.loads(rp.read_text(encoding="utf-8"))
     info["name"] = new_name
-    rp.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(rp, info)
     return {"ok": True, "case_id": case_id, "name": new_name}
 
 
@@ -712,7 +833,14 @@ def get_mesh(case_id: str, name: str):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    """存活探针。附带存储状态：挂载盘掉线时 writable=false，便于告警区分。"""
+    return {"status": "ok", "storage": storage_info()}
+
+
+@app.get("/api/storage")
+def storage_status():
+    """存储详情（强制刷新缓存），排障用。"""
+    return storage_info(refresh=True)
 
 
 @app.get("/api/cases")
@@ -828,7 +956,9 @@ def qrcode(case: str, base: str = ""):
     return Response(content=buf.getvalue(), media_type="image/png")
 
 def cleanup_old_cases(days=7):
-    """删除超过 days 天未更新的病例（存储自动清理）。"""
+    """删除超过 days 天未更新的病例（存储自动清理）。days<=0 时不做任何删除。"""
+    if days is None or days <= 0:
+        return 0
     cutoff = time.time() - days * 86400
     if not OUTPUT_DIR.is_dir():
         return 0
@@ -846,15 +976,29 @@ def cleanup_old_cases(days=7):
     return removed
 
 
-def _cleanup_loop(interval_hours=6, days=None):
-    if days is None:
+def cleanup_stale_uploads(days=1):
+    """清掉遗留的上传暂存目录（进程被杀 / 容器重启留下的孤儿）。"""
+    cutoff = time.time() - days * 86400
+    if not UPLOAD_STAGING.is_dir():
+        return 0
+    removed = 0
+    for d in UPLOAD_STAGING.iterdir():
         try:
-            days = int(os.environ.get("CASE_EXPIRE_DAYS", "7"))
+            if d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
         except Exception:
-            days = 7
+            continue
+    return removed
+
+
+def _cleanup_loop(interval_hours=6, days=None):
     while True:
         try:
-            cleanup_old_cases(days)
+            d = case_expire_days() if days is None else days
+            if d and d > 0:
+                cleanup_old_cases(d)
+            cleanup_stale_uploads()
         except Exception:
             pass
         time.sleep(interval_hours * 3600)
@@ -862,30 +1006,55 @@ def _cleanup_loop(interval_hours=6, days=None):
 
 @app.on_event("startup")
 def _start_auto_cleanup():
+    ok, msg = ensure_storage()
+    info = storage_info(refresh=True)
+    if ok:
+        print("[Lung3D] storage ready: backend=%s path=%s staging=%s free=%sGB" % (
+            info["backend"], info["path"], info["staging"], info["free_gb"]))
+        if info["backend"] == "local":
+            print("[Lung3D] WARNING 存储为容器本地盘，重启/缩容会丢数据；"
+                  "生产请设置 CASE_ROOT 指向挂载盘或 CFS")
+    else:
+        print("[Lung3D] ERROR 存储不可写: %s (%s)" % (info["path"], msg))
     t = threading.Thread(target=_cleanup_loop, args=(6,), kwargs={"days": None}, daemon=True)
     t.start()
-    print("[Lung3D] auto cleanup started: delete cases older than CASE_EXPIRE_DAYS(default 7d) every 6h")
+    d = case_expire_days()
+    print("[Lung3D] auto cleanup started: CASE_EXPIRE_DAYS=%s (%s), every 6h" % (
+        d, "disabled" if d <= 0 else "days"))
 
 
 
 def main():
     import uvicorn
 
+    global OUTPUT_DIR
+
     ap = argparse.ArgumentParser(description="Lung3D Web 后端")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--web", default=str(ROOT / "web"),
                     help="网页前端静态目录(可选)")
+    ap.add_argument("--case-root", default=None,
+                    help="病例产物根目录（等价于环境变量 CASE_ROOT）")
     args = ap.parse_args()
+
+    # 命令行参数优先于环境变量（必须在挂载静态目录之前生效）
+    if args.case_root:
+        os.environ[CASE_ROOT_ENV] = args.case_root
+        OUTPUT_DIR = _resolve_dir(CASE_ROOT_ENV, DEFAULT_CASE_ROOT)
 
     web_dir = Path(args.web)
     if web_dir.is_dir():
         from fastapi.staticfiles import StaticFiles
         app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ok, msg = ensure_storage()
+    info = storage_info(refresh=True)
     print(f"Lung3D API: http://{args.host}:{args.port}")
-    print(f"输出目录: {OUTPUT_DIR}")
+    print(f"存储后端: {info['backend']}  病例目录: {info['path']}  "
+          f"暂存目录: {info['staging']}  可用: {info['free_gb']}GB")
+    if not ok:
+        print(f"⚠️ 存储不可写: {msg}")
     uvicorn.run(app, host=args.host, port=args.port)
 
 

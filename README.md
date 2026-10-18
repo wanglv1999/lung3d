@@ -140,6 +140,14 @@ run_web.bat
 
 - 网页版：打开 `http://localhost:8000`，上传 nii.gz 或数据 zip 即可在线查看 3D。
 - 接口：`POST /api/process`、`GET /api/case/{id}`、`GET /api/mesh/{case_id}/{name}.glb`、`GET /api/cases`。
+- **数据持久化**：病例产物默认落 `web_output/cases`（容器内即临时盘，重启会丢）。生产用 `CASE_ROOT` 指到挂载盘：
+  ```bash
+  # 轻量服务器（宿主机目录 bind mount）
+  docker run -v /data/lung3d/cases:/data/cases -e CASE_ROOT=/data/cases -p 8000:8000 lung3d-web
+  # 微信云托管：控制台挂载 CFS 到 /data，环境变量 CASE_ROOT=/data/cases
+  ```
+  上传原件先落本地临时盘（`UPLOAD_STAGING_DIR`），处理完自动删除，不占持久盘。
+  `CASE_EXPIRE_DAYS` 控制自动清理（默认 7 天，设 `0` 关闭）。`GET /api/health` 返回 `storage` 段可查后端与剩余空间。
 - 微信小程序码：将真实 `appid/secret` 写入 `wx_config.json`（模板见 `wx_config.example.json`），调用 `GET /api/wxacode?case=<id>`。**请勿把真实密钥提交到 git。**
 
 ### 4. 数据目录打包（`lung3d_pack_data.py`）

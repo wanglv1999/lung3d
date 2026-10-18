@@ -18,8 +18,13 @@ RUN pip install --no-cache-dir -r requirements-web.txt
 COPY lung3d_api.py ./
 COPY web ./web
 
-# 病例输出目录（临时盘；如需持久化再挂载 CFS/COS）
-RUN mkdir -p /app/web_output/cases
+# 病例产物目录：容器内默认落临时盘；生产用 CASE_ROOT 指向挂载盘（CFS / 宿主机 bind mount）
+# 微信云托管：控制台挂载 CFS 到 /data，CASE_ROOT=/data/cases
+# 轻量服务器：docker-compose 把宿主机 /data/lung3d/cases 挂到 /data/cases
+ENV CASE_ROOT=/data/cases
+# 上传暂存放容器本地临时盘，处理完即删（大文件不写持久盘）
+ENV UPLOAD_STAGING_DIR=/tmp/lung3d_uploads
+RUN mkdir -p /data/cases /tmp/lung3d_uploads /app/web_output/cases
 
 EXPOSE 8000
 
