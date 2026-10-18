@@ -113,7 +113,7 @@ body {
   bottom: 0;
   background: #161b22;
 }
-.site-footer a { color: #8b949e; text-decoration: none; }
+.site-footer a { display: block; line-height: 1.7; color: #8b949e; text-decoration: none; }
 .site-footer a:hover { color: #58a6ff; text-decoration: underline; }
 
 #viewport { flex: 1; position: relative; touch-action: none; -webkit-touch-callout: none; }
