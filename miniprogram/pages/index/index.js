@@ -1,4 +1,4 @@
-const { BASE, ICP_BEIAN } = require('../../config')
+const { BASE, ICP_BEIAN, POLICE_BEIAN } = require('../../config')
 
 Page({
   data: {
@@ -6,6 +6,7 @@ Page({
     error: '',
     cases: [],
     icpBeian: ICP_BEIAN,
+    policeBeian: POLICE_BEIAN,
   },
 
   onShow() {
@@ -16,6 +17,14 @@ Page({
     if (!this.data.icpBeian) return
     wx.setClipboardData({
       data: this.data.icpBeian,
+      success: () => wx.showToast({ title: '备案号已复制', icon: 'none' }),
+    })
+  },
+
+  copyPoliceBeian() {
+    if (!this.data.policeBeian) return
+    wx.setClipboardData({
+      data: this.data.policeBeian,
       success: () => wx.showToast({ title: '备案号已复制', icon: 'none' }),
     })
   },
