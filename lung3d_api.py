@@ -923,10 +923,16 @@ def _wx_post_png(url, body):
 def wxacode(case: str, env: str = None, env_version: str = None):
     """生成打开该病例 3D 页的微信小程序码(PNG)。
 
-    优先 `getwxacodeunlimited`（scene=c=<id>，不限量）；当它返回 40066 时自动
-    降级到 `getwxacode`（path=pages/viewer/viewer?c=<id>，总量 10 万张）。
-    40066 与页面路径无关 —— 实测连首页路径、连不带 page 也报，
-    真实原因是**小程序没有正式发布版本**，此时不限量接口整类不可用。
+    优先 `getwxacodeunlimit`（scene=c=<id>，不限量）；失败时降级到
+    `getwxacode`（path=pages/viewer/viewer?c=<id>，总量 10 万张）。
+
+    ⚠️ 历史坑（2026-10-19 定位）：接口路径是 **`/wxa/getwxacodeunlimit`**，
+    没有 "ed" 后缀。此前一直写成 `getwxacodeunlimited`，微信对不存在的路径
+    返回的正是 `40066 invalid url` —— 这个错误码极具误导性，会让人以为是
+    「页面不存在 / 小程序未发布 / 未备案」，实测与这些都无关，纯路径拼错。
+    排查时用 `getwxacode` 作对照即可快速区分（它能通、unlimited 全参数报
+    40066，就说明不是页面或账号问题）。
+
     前端 `viewer.js` 的 resolveCaseId 同时认 `options.c` 与 scene，两种码都能直达。
     响应头 `X-Wxacode-Mode` 标明实际用的是哪种（unlimited / limited）。
     """
@@ -951,7 +957,7 @@ def wxacode(case: str, env: str = None, env_version: str = None):
         "auto_color": False,
     }
     data, err = _wx_post_png(
-        "https://api.weixin.qq.com/wxa/getwxacodeunlimited?access_token=" + tok_q, unlimited_body)
+        "https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token=" + tok_q, unlimited_body)
     mode = "unlimited"
     if err is not None:
         limited_body = {"path": "pages/viewer/viewer?c=" + case, "width": 430, "auto_color": False}
