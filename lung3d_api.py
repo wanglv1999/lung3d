@@ -359,6 +359,94 @@ def downsample_binary(mask, factor):
     return (ndimage.zoom(mask.astype(np.uint8), 1.0 / factor, order=0) > 0.5)
 
 
+def smooth_mesh_safe(mesh, iterations=15, lamb=0.5, nu=0.5):
+    """Taubin 平滑 + 非流形顶点保护 + 位移钳制（防止放射状毛刺）。
+
+    背景（2026-10-19 定位）：marching_cubes 对薄壁管状结构（气管）降采样后
+    会产生**非流形顶点**（被 8~12 个三角面共用，正常闭合曲面约 6）。trimesh
+    的 laplacian_calculation 用 `edges_to_coo(mesh.edges)` 构建邻接矩阵，只加
+    单向边，非流形顶点的入度 ≠ 出度；随后的行归一化对这些行失效，行和变成
+    0.67~0.88 而不是 1。此时 `L·v` 算出的"邻居均值"严重偏离，**第一轮迭代
+    就把顶点推出上百毫米**，渲染出来就是很长的放射状毛刺。
+
+    实测 MESH_DS_FACTOR=3 时气管 7974 个顶点里恰好有 19 个行和 ≠ 1，与 19 个
+    被推飞的顶点完全重合（最长边 285mm）。ds=2/4 时为 0 个，所以默认配置下
+    看不到这个问题；本机 viewer3d.py 直读 nii.gz 不走这条链路，也正常。
+
+    对策两层：
+      1. 检测行和 ≠ 1 的顶点，作为 pinned_vertices 传给 trimesh（该顶点
+         只与自己相邻，Taubin 迭代时原地不动），从源头消除发散；
+      2. 兜底位移钳制：任何顶点位移超过 3 倍中位边长就回滚原值。
+
+    正常网格（行和全为 1）两条都不触发，几何与未加保护时逐位一致。
+    返回被回滚的顶点数。
+    """
+    import trimesh
+    if iterations <= 0 or len(mesh.faces) <= 4:
+        return 0
+    before = np.array(mesh.vertices, copy=True)
+    try:
+        med_edge = float(np.median(mesh.edges_unique_length))
+    except Exception:
+        med_edge = 1.0
+    limit = max(3.0 * med_edge, 1.5)
+
+    # --- 1) 固定归一化失效的非流形顶点 ---
+    pinned = None
+    operator = None
+    try:
+        operator = trimesh.smoothing.laplacian_calculation(mesh)
+        rowsum = np.asarray(operator.sum(axis=1)).ravel()
+        bad = np.where(np.abs(rowsum - 1.0) > 1e-6)[0]
+        if len(bad):
+            pinned = bad
+            operator = trimesh.smoothing.laplacian_calculation(
+                mesh, pinned_vertices=bad)
+        else:
+            operator = None
+    except Exception:
+        pinned = None
+        operator = None
+
+    try:
+        if operator is not None:
+            trimesh.smoothing.filter_taubin(
+                mesh, lamb=lamb, nu=nu, iterations=iterations,
+                laplacian_operator=operator)
+        else:
+            trimesh.smoothing.filter_taubin(
+                mesh, lamb=lamb, nu=nu, iterations=iterations)
+    except Exception:
+        return 0
+
+    # --- 2) 兜底：位移钳制 ---
+    after = np.asarray(mesh.vertices)
+    shift = np.linalg.norm(after - before, axis=1)
+    over = shift > limit
+    n = int(over.sum())
+    if n:
+        fixed = np.array(after, copy=True)
+        fixed[over] = before[over]
+        mesh.vertices = fixed
+    if pinned is not None or n:
+        print("  [平滑保护] 固定非流形顶点 %d 个，回滚越界顶点 %d 个（位移上限 %.2fmm）"
+              % (0 if pinned is None else len(pinned), n, limit))
+    return n
+
+
+def mesh_max_edge(mesh):
+    """返回 (最长边mm, 中位边mm, 超10倍中位边长的边数)，用于网格质量自检。"""
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    f = np.asarray(mesh.faces, dtype=np.int64)
+    if len(f) == 0:
+        return 0.0, 0.0, 0
+    tri = v[f]
+    e = np.stack([tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 1], tri[:, 0] - tri[:, 2]], axis=1)
+    L = np.linalg.norm(e, axis=2)
+    med = float(np.median(L))
+    return float(L.max()), med, int((L > med * 10).sum())
+
+
 def mask_to_trimesh(mask, affine, ds_factor=2, smooth=15, prune_mm=0.0):
     """二值掩膜 -> trimesh（RAS 世界坐标，与桌面查看器一致）。
     prune_mm: >0 时按管径阈值剪除细血管（在降采样后计算，避免内存爆槓）。"""
@@ -388,11 +476,8 @@ def mask_to_trimesh(mask, affine, ds_factor=2, smooth=15, prune_mm=0.0):
         mesh.update_faces(mesh.unique_faces)
     except Exception:
         pass
-    if smooth > 0 and len(mesh.faces) > 4:
-        try:
-            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=0.5, iterations=smooth)
-        except Exception:
-            pass
+    if smooth > 0:
+        smooth_mesh_safe(mesh, iterations=smooth)
     try:
         _ = mesh.vertex_normals  # 触发法线计算
     except Exception:
@@ -609,6 +694,10 @@ def build_case(case_dir, masks, ct_data, ct_affine, report, label_cfg=None):
         if mesh is None:
             continue
         fname = f"{key}.glb"
+        _mx, _med, _nlong = mesh_max_edge(mesh)
+        if _nlong:
+            print("  [网格自检] %s 有 %d 条超长边（最长 %.1fmm / 中位 %.2fmm），渲染可能出现毛刺"
+                  % (key, _nlong, _mx, _med))
         export_glb(mesh, mesh_dir / fname)
         vox = abs(np.linalg.det(a)) / 1000.0  # cm^3
         structures.append({
