@@ -36,3 +36,5 @@ monai_nodule/.cache/
 # 系统
 Thumbs.db
 .DS_Store
+# 补丁脚本自动生成的备份
+*.bak_*

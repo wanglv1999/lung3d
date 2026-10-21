@@ -12,10 +12,13 @@ ENV PIP_TRUSTED_HOST=mirrors.cloud.tencent.com
 
 # 只装 Web 所需轻量依赖（不含 torch/TotalSegmentator）
 COPY requirements-web.txt ./
-RUN pip install --no-cache-dir -r requirements-web.txt
+# vtk 用于全精度等值面引擎（FlyingEdges3D），wheel 约 90MB、装完镜像约 +300MB
+RUN pip install --no-cache-dir -r requirements-web.txt "vtk>=9.2,<10"
 
 # 后端 + 网页前端
 COPY lung3d_api.py ./
+# 全精度网格引擎（MESH_ENGINE=vtk 时被 lung3d_api 导入）
+COPY lung3d_mesh_vtk.py ./
 COPY web ./web
 
 # 病例产物目录：容器内默认落临时盘；生产用 CASE_ROOT 指向挂载盘（CFS / 宿主机 bind mount）

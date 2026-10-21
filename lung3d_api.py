@@ -68,6 +68,14 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 
 ROOT = Path(__file__).resolve().parent
 
+# [mesh-vtk-patch] 全精度等值面引擎（可选）。导入失败时自动退回 skimage 老路径，
+# 这样即使容器里没装 vtk，后端也能照常启动。
+try:
+    import lung3d_mesh_vtk as _mesh_vtk
+except Exception as _e:  # pragma: no cover
+    _mesh_vtk = None
+    print("  [mesh] lung3d_mesh_vtk 不可用（%s），网格仍走 skimage" % _e)
+
 # ---------------------------------------------------------------------------
 # 存储位置（持久化改造）
 # ---------------------------------------------------------------------------
@@ -447,7 +455,55 @@ def mesh_max_edge(mesh):
     return float(L.max()), med, int((L > med * 10).sum())
 
 
-def mask_to_trimesh(mask, affine, ds_factor=2, smooth=15, prune_mm=0.0):
+# [mesh-vtk-patch] 引擎分发
+# MESH_ENGINE=vtk      -> 全精度 VTK 引擎（推荐，2 核 2G 实测峰值 880MB）
+# MESH_ENGINE=skimage  -> 退回原来的 skimage 实现（默认行为不变）
+# MESH_ENGINE=auto      -> 装了 vtk 就用 vtk（本补丁的默认）
+MESH_ENGINE_ENV = "MESH_ENGINE"
+
+
+def mesh_engine():
+    """当前生效的网格引擎名：vtk / skimage。
+
+    安全阀：如果显式要求 vtk 但模块不可用，**直接抛错**而不是静默退回
+    skimage —— 因为退回后会带着 MESH_DS_FACTOR=1 走 skimage，峰值约 4.6GB，
+    2G 容器必被 OOM killer 杀掉，而且现象是"上传一直失败"，极难排查。
+    """
+    want = (os.environ.get(MESH_ENGINE_ENV) or "auto").strip().lower()
+    if _mesh_vtk is None:
+        if want == "vtk":
+            raise RuntimeError(
+                "MESH_ENGINE=vtk 但 vtk 模块不可用。请先 pip install vtk，"
+                "或把 MESH_ENGINE 改回 skimage。注意 skimage 不能跑全精度"
+                "（MESH_DS_FACTOR=1 约需 4.6GB 内存）。")
+        return "skimage"
+    if want in ("vtk", "skimage"):
+        return want
+    return _mesh_vtk.engine_name()
+
+
+def mask_to_trimesh(mask, affine, ds_factor=2, smooth=None, prune_mm=0.0,
+                    key=None, role=None):
+    """按 MESH_ENGINE 分发到具体实现。
+
+    smooth=None 时：vtk 走 MESH_SMOOTH（默认 5），skimage 走原来的 15。
+    key/role 只用来查面数预算（MESH_FACE_BUDGET），不影响几何。
+    """
+    eng = mesh_engine()
+    if eng == "vtk":
+        return _mesh_vtk.mask_to_trimesh(
+            mask, affine, ds_factor=ds_factor, smooth=smooth,
+            prune_mm=prune_mm, key=key, role=role)
+    # skimage 兜底：它撑不住全精度，硬性钳到 2 档，避免整机 OOM
+    if ds_factor is None or int(ds_factor) < 2:
+        print("  [WARN] skimage 引擎不支持全精度（峰值约 4.6GB），已回退 ds_factor=2")
+        ds_factor = 2
+    s = 15 if smooth is None else int(smooth)
+    return _mask_to_trimesh_skimage(
+        mask, affine, ds_factor=ds_factor, smooth=s, prune_mm=prune_mm)
+
+
+def _mask_to_trimesh_skimage(mask, affine, ds_factor=2, smooth=15, prune_mm=0.0):
     """二值掩膜 -> trimesh（RAS 世界坐标，与桌面查看器一致）。
     prune_mm: >0 时按管径阈值剪除细血管（在降采样后计算，避免内存爆槓）。"""
     import skimage.measure
@@ -687,10 +743,12 @@ def build_case(case_dir, masks, ct_data, ct_affine, report, label_cfg=None):
             palette_idx += 1
         role = st.get("role", "") if st else ""
         if role == ROLE_WALL:
-            mesh = mask_to_trimesh(m, a, ds_factor=ds_wall, smooth=0)
+            mesh = mask_to_trimesh(m, a, ds_factor=ds_wall, smooth=0,
+                                   key=key, role=role)
         else:
             prune_mm = distal_prune_mm if role == ROLE_VESSEL else 0.0
-            mesh = mask_to_trimesh(m, a, ds_factor=ds_env, prune_mm=prune_mm)
+            mesh = mask_to_trimesh(m, a, ds_factor=ds_env, prune_mm=prune_mm,
+                                   key=key, role=role)
         if mesh is None:
             continue
         fname = f"{key}.glb"

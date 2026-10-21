@@ -11,15 +11,36 @@ services:
       - "127.0.0.1:8000:8000"
 
     environment:
-      # ---- 2核2G 专项调优 ----
-      # 网格降采样系数：越大越省内存/耗时（质量略降）。2核2G 建议 3，紧张时调 4
-      MESH_DS_FACTOR: "3"
+      # ---- 网格引擎：全精度 + 血管远端细支剪枝 ----
+      # 换 VTK FlyingEdges3D 后内存低一个量级，可以跑全精度（不再降采样）
+      MESH_ENGINE: "vtk"
+      # 全精度：不要再降采样。skimage 撑不住（峰值约 4.6GB），有安全阀会拦
+      MESH_DS_FACTOR: "1"
+      # 关掉旧的按管径硬剪——它会在管子中间拦腰截断，正是"血管断裂"的来源
+      DISTAL_PRUNE_MM: "0"
+
+      # 血管只保留直径 >= 2mm 的分支（临床口径）；0 = 保留全部末梢
+      MESH_MIN_VESSEL_D_MM: "2.0"
+      # open 省内存；edt 精确但多占约 400MB，2G 容器不要开
+      MESH_PRUNE_RADIUS_MODE: "open"
+      # 开运算结构元邻域：1=6邻域(留97%) 2=18邻域(留89%，默认) 3=26邻域(留75%)
+      MESH_PRUNE_STRUCT_CONN: "2"
+      # 剪枝后血管连通块体积下限(mm³)，清掉细颈断开掉下的碎片
+      MESH_MIN_BLOCK_MM3: "20"
+      # 仅 edt 模式使用的切断膨胀体素
+      MESH_PRUNE_CUT_VOX: "1"
+
+      # 平滑 15 -> 5：WindowedSinc 迭代太多会把细管缩断
+      MESH_SMOOTH: "5"
+      # 按结构限面数；0 = 不简化（结节很小，没必要）
+      MESH_FACE_BUDGET: "arteries:25000,veins:25000,airways:20000,nodules:0"
+      # 非血管结构的碎块阈值(mm³)
+      MESH_MIN_COMPONENT_MM3: "2"
+
       # 气道壁单独再降一档
       WALL_DS_FACTOR: "4"
-      # 串行处理，防并发 OOM
+      # 串行处理，防并发 OOM：单例峰值约 1.0~1.2GB，2 个并发就撞上 1536MB
       MAX_CONCURRENT_PROCESSING: "1"
-      # 远端细血管剪除阈值(mm)：越大网格越小
-      DISTAL_PRUNE_MM: "1.0"
       # 本地盘无临时盘顾虑，放宽自动清理周期(天)；设 0 则完全不删
       CASE_EXPIRE_DAYS: "30"
       # 病例产物根目录（与下方 volume 的容器侧路径一致）
