@@ -12,8 +12,15 @@ ENV PIP_TRUSTED_HOST=mirrors.cloud.tencent.com
 
 # 只装 Web 所需轻量依赖（不含 torch/TotalSegmentator）
 COPY requirements-web.txt ./
-# vtk 用于全精度等值面引擎（FlyingEdges3D），wheel 约 90MB、装完镜像约 +300MB
-RUN pip install --no-cache-dir -r requirements-web.txt "vtk>=9.2,<10"
+RUN pip install --no-cache-dir -r requirements-web.txt
+
+# vtk 用于全精度等值面引擎（FlyingEdges3D），装完镜像约 +300MB。
+# wheel 139MB，容器内直连 PyPI 镜像会 ReadTimeout（腾讯云镜像还会返回空文件，
+# sha256 为空内容的哈希 e3b0c442…），所以改成本机下载后 COPY 进镜像。
+# 重新获取：pip download vtk==9.7.1 --platform manylinux2014_x86_64 \
+#           --python-version 312 --only-binary=:all: -d vendor
+COPY vendor/vtk-9.7.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl /tmp/
+RUN pip install --no-cache-dir /tmp/vtk-9.7.1-*.whl && rm -f /tmp/vtk-*.whl
 
 # 后端 + 网页前端
 COPY lung3d_api.py ./
